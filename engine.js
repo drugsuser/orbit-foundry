@@ -1,141 +1,2945 @@
+"use strict";
+(() => {
+  const G = 4 * Math.PI * Math.PI,
+    AU = 149597870.7,
+    MS = 1.98847e30,
+    YR = 31557600,
+    VUNIT = AU / YR,
+    C = 299792.458 / VUNIT,
+    MAX = 180,
+    TAU = 2 * Math.PI;
+  const $ = (id) => document.getElementById(id),
+    cv = $("space"),
+    ctx = cv.getContext("2d", { alpha: true });
+  const presets = {
+    earth: {
+      name: "Планета",
+      kind: "rock",
+      mass: 3.003e-6,
+      r: 6371 / AU,
+      color: "#72b9e4",
+    },
+    gas: {
+      name: "Гигант",
+      kind: "gas",
+      mass: 0.0009543,
+      r: 69911 / AU,
+      color: "#dbb78c",
+    },
+    moon: {
+      name: "Спутник",
+      kind: "rock",
+      mass: 3.694e-8,
+      r: 1737.4 / AU,
+      color: "#bbb9b1",
+    },
+    star: {
+      name: "Звезда",
+      kind: "star",
+      mass: 1,
+      r: 695700 / AU,
+      color: "#ffcf85",
+    },
+    bh: {
+      name: "Чёрная дыра",
+      kind: "bh",
+      mass: 10,
+      r: (2 * G * 10) / (C * C),
+      color: "#eda671",
+    },
+    asteroid: {
+      name: "Астероид",
+      kind: "asteroid",
+      mass: 1e-12,
+      r: 50 / AU,
+      color: "#a5a2a0",
+    },
+  };
+  let bodies = [],
+    nextId = 1,
+    selected = null,
+    follow = null,
+    t = 0,
+    paused = false,
+    tool = "select",
+    scenario = "solar",
+    energy0 = null,
+    steps = 0,
+    lastFPS = 60,
+    limited = false;
+  let W = innerWidth,
+    H = innerHeight,
+    dpr = Math.min(devicePixelRatio || 1, 2),
+    yaw = -0.28,
+    tilt = 0.52,
+    scale = 100,
+    cam = { x: 0, y: 0, z: 0 },
+    targetScale = 100;
+  let cameraFlight = null;
+  let pointer = null,
+    mouse = { x: 0, y: 0 },
+    hover = null,
+    dirtyList = true,
+    events = [],
+    effects = [],
+    pred = [],
+    lastPred = 0,
+    baselineDirty = true;
+  let orbitAnchor = null;
+  let launchPath = [],
+    launchPathTime = 0,
+    launchPathStamp = "",
+    fieldSources = [];
+  let settings = {
+    collision: "merge",
+    accuracy: 0.035,
+    soft: 1e-6,
+    tides: true,
+    rel: false,
+  };
+  let stats = { mass: 0, p: 0, E: 0, drift: 0, com: { x: 0, y: 0, z: 0 } };
+  const kinds = {
+    star: "Звезда",
+    rock: "Каменистое тело",
+    gas: "Газовый гигант",
+    bh: "Чёрная дыра",
+    asteroid: "Астероид",
+    debris: "Обломок",
+  };
+  let seed = 23849;
+  function rand() {
+    seed = (1664525 * seed + 1013904223) >>> 0;
+    return seed / 4294967296;
+  }
+  const stars = Array.from({ length: 680 }, () => ({
+    x: rand(),
+    y: rand(),
+    s: 0.3 + rand() * 1.2,
+    a: 0.12 + rand() * 0.6,
+    c: rand(),
+  }));
+  function resize() {
+    W = innerWidth;
+    H = innerHeight;
+    dpr = Math.min(devicePixelRatio || 1, 2);
+    cv.width = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+    cv.style.width = W + "px";
+    cv.style.height = H + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  addEventListener("resize", resize);
+  resize();
+  function fmt(n, d = 2) {
+    if (!Number.isFinite(n)) return "—";
+    if (n !== 0 && (Math.abs(n) < 0.001 || Math.abs(n) >= 1e6))
+      return n.toExponential(2);
+    return n.toLocaleString("ru-RU", { maximumFractionDigits: d });
+  }
+  function vec(x = 0, y = 0, z = 0) {
+    return { x, y, z };
+  }
+  function len(v) {
+    return Math.hypot(v.x, v.y, v.z);
+  }
+  function body(o) {
+    let b = {
+      id: nextId++,
+      name: "Тело",
+      kind: "rock",
+      mass: 3e-6,
+      r: 6371 / AU,
+      x: 0,
+      y: 0,
+      z: 0,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      ax: 0,
+      ay: 0,
+      az: 0,
+      color: "#80c8ea",
+      trail: [],
+      tidalDone: false,
+      ...o,
+    };
+    if (b.kind === "bh") b.r = (2 * G * b.mass) / (C * C);
+    bodies.push(b);
+    dirtyList = true;
+    baselineDirty = true;
+    return b;
+  }
+  function getSelected() {
+    return bodies.find((b) => b.id === selected);
+  }
+  function notify(text) {
+    $("toast").textContent = text;
+    $("toast").classList.add("show");
+    clearTimeout(notify.timer);
+    notify.timer = setTimeout(() => $("toast").classList.remove("show"), 3400);
+  }
+  function event(text) {
+    events.unshift({ t, text });
+    events = events.slice(0, 45);
+    $("events").replaceChildren(
+      ...events.slice(0, 22).map((e) => {
+        let d = document.createElement("div");
+        d.className = "event";
+        let tm = document.createElement("time");
+        tm.textContent = fmt(e.t, 3) + " г.";
+        d.append(tm, document.createTextNode(e.text));
+        return d;
+      }),
+    );
+  }
+  function select(b) {
+    selected = b ? b.id : null;
+    syncFields();
+    dirtyList = true;
+    pred = [];
+    lastPred = 0;
+  }
+  function syncFields() {
+    let b = getSelected();
+    for (const id of [
+      "editName",
+      "editMass",
+      "editRadius",
+      "editVx",
+      "editVy",
+      "editVz",
+      "editColor",
+      "applyBtn",
+      "followBtn",
+      "focusBtn",
+      "circularBtn",
+      "removeBtn",
+      "prograde",
+      "retrograde",
+    ])
+      $(id).disabled = !b;
+    if (!b) {
+      for (let id of [
+        "editName",
+        "editMass",
+        "editRadius",
+        "editVx",
+        "editVy",
+        "editVz",
+      ])
+        $(id).value = "";
+      $("editColor").value = "#53657a";
+      $("bodySwatch").style.background = "#53657a";
+      $("bodyName").textContent = "Ничего не выбрано";
+      $("bodyKind").textContent = "Щёлкните по телу";
+      $("bodyId").textContent = "";
+      updateLaunchNote();
+      return;
+    }
+    $("bodyName").textContent = b.name;
+    $("bodyKind").textContent = kinds[b.kind] || "Тело";
+    $("bodyId").textContent = "#" + b.id;
+    $("bodySwatch").style.background = b.color;
+    $("editName").value = b.name;
+    $("editMass").value = +b.mass.toPrecision(7);
+    $("editRadius").value = +(b.r * AU).toPrecision(7);
+    $("editRadius").disabled = b.kind === "bh";
+    $("editVx").value = +(b.vx * VUNIT).toFixed(5);
+    $("editVy").value = +(b.vy * VUNIT).toFixed(5);
+    $("editVz").value = +(b.vz * VUNIT).toFixed(5);
+    $("editColor").value = b.color;
+    $("followBtn").classList.toggle("active", follow === b.id);
+    updateLaunchNote();
+  }
+  function centerMomentum() {
+    let m = 0,
+      p = vec(),
+      c = vec();
+    for (let b of bodies) {
+      m += b.mass;
+      p.x += b.mass * b.vx;
+      p.y += b.mass * b.vy;
+      p.z += b.mass * b.vz;
+      c.x += b.mass * b.x;
+      c.y += b.mass * b.y;
+      c.z += b.mass * b.z;
+    }
+    if (!m) return;
+    for (let b of bodies) {
+      b.vx -= p.x / m;
+      b.vy -= p.y / m;
+      b.vz -= p.z / m;
+      b.x -= c.x / m;
+      b.y -= c.y / m;
+      b.z -= c.z / m;
+      b.trail = [];
+    }
+    cam = vec();
+    baselineDirty = true;
+  }
+  function dominant(b) {
+    let best = null,
+      max = 0;
+    for (let a of bodies) {
+      if (a === b) continue;
+      let q =
+        a.mass /
+        ((a.x - b.x) ** 2 +
+          (a.y - b.y) ** 2 +
+          (a.z - b.z) ** 2 +
+          settings.soft ** 2);
+      if (q > max) {
+        max = q;
+        best = a;
+      }
+    }
+    return best;
+  }
+  function orbitVel(b, c, inclination = 0) {
+    let x = b.x - c.x,
+      y = b.y - c.y,
+      z = b.z - c.z,
+      r = Math.hypot(x, y, z);
+    if (!r) return null;
+    let h = Math.hypot(x, y),
+      tx = h > 1e-12 ? -y / h : 1,
+      ty = h > 1e-12 ? x / h : 0;
+    let v = Math.sqrt(
+      (G * (b.mass + c.mass) * r * r) /
+        Math.pow(r * r + settings.soft ** 2, 1.5),
+    );
+    return {
+      vx: tx * v * Math.cos(inclination),
+      vy: ty * v * Math.cos(inclination),
+      vz: v * Math.sin(inclination),
+    };
+  }
+  function setCircular(b, c) {
+    let v = orbitVel(b, c);
+    if (!v) return;
+    b.vx = c.vx + v.vx;
+    b.vy = c.vy + v.vy;
+    b.vz = c.vz + v.vz;
+    baselineDirty = true;
+    syncFields();
+  }
+  function orbitBody(c, p, d, a, extra = {}) {
+    let b = body({
+      ...p,
+      x: c.x + d * Math.cos(a),
+      y: c.y + d * Math.sin(a),
+      z: 0,
+      ...extra,
+    });
+    let v = orbitVel(b, c, extra.inc || 0);
+    b.vx = c.vx + v.vx;
+    b.vy = c.vy + v.vy;
+    b.vz = c.vz + v.vz;
+    return b;
+  }
+  const scenes = {
+    solar: {
+      title: "Солнечная система",
+      short: "Солнечная",
+      desc: "Солнце и восемь планет. Выберите мир — камера приблизит его.",
+      rate: -1.5,
+      build() {
+        let sun = body({ ...presets.star, name: "Солнце", planet: "sun" });
+        let data = [
+          ["Меркурий", 1.66e-7, 2439.7, 0.387, "#bcaaa0"],
+          ["Венера", 2.447e-6, 6051.8, 0.723, "#e6bd83"],
+          ["Земля", 3.003e-6, 6371, 1, "#79bde8"],
+          ["Марс", 3.227e-7, 3389.5, 1.524, "#e79776"],
+          ["Юпитер", 0.0009543, 69911, 5.203, "#d5b18b"],
+          ["Сатурн", 0.0002857, 58232, 9.537, "#e0cca2"],
+          ["Уран", 0.00004365, 25362, 19.19, "#96dbdc"],
+          ["Нептун", 0.00005149, 24622, 30.07, "#6d95e0"],
+        ];
+        data.forEach((d, i) =>
+          orbitBody(
+            sun,
+            {
+              name: d[0],
+              planet: ["mercury","venus","earth","mars","jupiter","saturn","uranus","neptune"][i],
+              mass: d[1],
+              r: d[2] / AU,
+              color: d[4],
+              kind: i > 3 ? "gas" : "rock",
+              ring: i === 5,
+            },
+            d[3],
+            i * 2.31 + 0.8,
+            { inc: i === 0 ? 0.07 : 0 },
+          ),
+        );
+        select(bodies[3]);
+        scale = targetScale = Math.min((W - 640) / 4.8, (H - 240) / 3.3);
+        cam = vec();
+      },
+      zoom: 3,
+    },
+  };
+  function loadScene(key, ask = true) {
+    if (key !== "solar") throw Error("Доступна только Солнечная система.");
+    cameraFlight = null;
+    if (
+      ask &&
+      !confirm(
+        "Заменить текущую систему сценарием «" +
+          scenes[key].title +
+          "»? Несохранённые изменения исчезнут.",
+      )
+    )
+      return;
+    clearTimeout(notify.timer);
+    $("toast").classList.remove("show");
+    scenario = key;
+    orbitAnchor = null;
+    bodies = [];
+    nextId = 1;
+    selected = null;
+    follow = null;
+    t = 0;
+    events = [];
+    effects = [];
+    pred = [];
+    energy0 = null;
+    settings.rel = key === "blackhole";
+    $("grRel").checked = settings.rel;
+    $("fieldMode").value = key === "blackhole" ? "schwarzschild" : "potential";
+    updateFieldUI();
+    yaw = -0.28;
+    tilt = 0.52;
+    $("view3d").classList.add("active");
+    $("viewTop").classList.remove("active");
+    paused = false;
+    pointer = null;
+    seed = 23849;
+    scenes[key].build();
+    centerMomentum();
+    $("timeRate").value = scenes[key].rate;
+    setRate();
+    setTool("select");
+    $("scenarioTitle").textContent = scenes[key].title;
+    $("scenarioDesc").textContent = scenes[key].desc;
+    document
+      .querySelectorAll("[data-scene]")
+      .forEach((b) => b.classList.toggle("active", b.dataset.scene === key));
+    event("Загружен сценарий: " + scenes[key].title);
+    accel(bodies);
+    syncFields();
+    updateStats();
+    uiUpdate();
+    updatePause();
+  }
+  function accel(arr) {
+    for (let b of arr) {
+      b.ax = 0;
+      b.ay = 0;
+      b.az = 0;
+    }
+    let eps2 = settings.soft * settings.soft;
+    for (let i = 0; i < arr.length; i++) {
+      let a = arr[i];
+      for (let j = i + 1; j < arr.length; j++) {
+        let b = arr[j],
+          x = b.x - a.x,
+          y = b.y - a.y,
+          z = b.z - a.z,
+          r2 = x * x + y * y + z * z + eps2,
+          inv = G / (r2 * Math.sqrt(r2)),
+          cor = 1;
+        if (settings.rel && (a.kind === "bh" || b.kind === "bh")) {
+          let vx = b.vx - a.vx,
+            vy = b.vy - a.vy,
+            vz = b.vz - a.vz,
+            h2 =
+              (y * vz - z * vy) ** 2 +
+              (z * vx - x * vz) ** 2 +
+              (x * vy - y * vx) ** 2;
+          cor += (3 * h2) / (r2 * C * C);
+        }
+        let f = inv * cor;
+        a.ax += x * f * b.mass;
+        a.ay += y * f * b.mass;
+        a.az += z * f * b.mass;
+        b.ax -= x * f * a.mass;
+        b.ay -= y * f * a.mass;
+        b.az -= z * f * a.mass;
+      }
+    }
+  }
+  function safeStep(arr = bodies) {
+    let dt = Infinity,
+      e = settings.soft ** 2;
+    for (let i = 0; i < arr.length; i++) {
+      let a = arr[i];
+      for (let j = i + 1; j < arr.length; j++) {
+        let b = arr[j],
+          r2 = (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2,
+          r = Math.sqrt(r2),
+          v = Math.hypot(a.vx - b.vx, a.vy - b.vy, a.vz - b.vz);
+        let dynam =
+          settings.accuracy *
+          Math.sqrt(Math.pow(r2 + e, 1.5) / (G * (a.mass + b.mass)));
+        if (dynam < dt) dt = dynam;
+        let crossing = (0.12 * Math.max(r, settings.soft)) / (v + 1e-25);
+        if (crossing < dt) dt = crossing;
+      }
+    }
+    return dt;
+  }
+  function leap(dt, arr) {
+    accel(arr);
+    for (let b of arr) {
+      b.vx += b.ax * dt * 0.5;
+      b.vy += b.ay * dt * 0.5;
+      b.vz += b.az * dt * 0.5;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.z += b.vz * dt;
+    }
+    accel(arr);
+    for (let b of arr) {
+      b.vx += b.ax * dt * 0.5;
+      b.vy += b.ay * dt * 0.5;
+      b.vz += b.az * dt * 0.5;
+    }
+  }
+  function simulate(wanted) {
+    let rem = wanted;
+    steps = 0;
+    limited = false;
+    let start = performance.now();
+    while (rem > 1e-15 && steps < 180) {
+      let dt = Math.min(rem, safeStep(), 0.02);
+      if (!(dt > 0) || !Number.isFinite(dt)) {
+        paused = true;
+        notify("Интегратор остановлен: недопустимый шаг.");
+        break;
+      }
+      leap(dt, bodies);
+      t += dt;
+      rem -= dt;
+      contacts();
+      steps++;
+      if (steps % 6 === 0 && performance.now() - start > 15) break;
+    }
+    limited = rem > wanted * 0.05;
+    return wanted - rem;
+  }
+  function removeBody(b, silent = false) {
+    bodies = bodies.filter((x) => x !== b);
+    if (selected === b.id) select(null);
+    if (follow === b.id) follow = null;
+    dirtyList = true;
+    baselineDirty = true;
+    pred = [];
+    if (!silent) event("Удалено: " + b.name);
+  }
+  function flash(x, y, z, color, size = 1) {
+    effects.push({ x, y, z, color, age: 0, size });
+  }
+  function merge(a, b) {
+    let m = a.mass + b.mass,
+      keep = a.mass >= b.mass ? a : b,
+      drop = keep === a ? b : a;
+    let x = (a.x * a.mass + b.x * b.mass) / m,
+      y = (a.y * a.mass + b.y * b.mass) / m,
+      z = (a.z * a.mass + b.z * b.mass) / m;
+    let bh = a.kind === "bh" || b.kind === "bh";
+    flash(x, y, z, bh ? "#fbc58c" : "#ffe2b2", bh ? 1 : 2);
+    keep.x = x;
+    keep.y = y;
+    keep.z = z;
+    keep.vx = (a.vx * a.mass + b.vx * b.mass) / m;
+    keep.vy = (a.vy * a.mass + b.vy * b.mass) / m;
+    keep.vz = (a.vz * a.mass + b.vz * b.mass) / m;
+    keep.r = Math.cbrt(a.r ** 3 + b.r ** 3);
+    keep.mass = m;
+    if (bh) {
+      keep.kind = "bh";
+      keep.r = (2 * G * m) / (C * C);
+      keep.color = "#eda671";
+    } else {
+      keep.name = keep.name + " +";
+      keep.trail = [];
+    }
+    event((bh ? "Поглощение: " : "Слияние: ") + drop.name + " → " + keep.name);
+    if (selected === drop.id) selected = keep.id;
+    if (follow === drop.id) follow = keep.id;
+    removeBody(drop, true);
+    syncFields();
+    return keep;
+  }
+  function splitBody(b, relativeSpeed = 0, tidal = false, hole = null) {
+    if (bodies.length + 6 > MAX || b.mass < 1e-14) return false;
+    let n = 7,
+      m = b.mass / n,
+      rad = b.r / Math.cbrt(n),
+      dir = [],
+      vmean = vec();
+    for (let i = 0; i < n; i++) {
+      let a = (TAU * i) / n,
+        d = { x: Math.cos(a), y: Math.sin(a), z: (i % 2 ? 1 : -1) * 0.35 };
+      dir.push(d);
+      vmean.x += d.x / n;
+      vmean.y += d.y / n;
+      vmean.z += d.z / n;
+    }
+    let spread = Math.max(
+      relativeSpeed * 0.16,
+      Math.sqrt((2 * G * b.mass) / Math.max(b.r, settings.soft)) * 0.12,
+    );
+    let first = null;
+    for (let i = 0; i < n; i++) {
+      let d = dir[i],
+        q = { x: d.x - vmean.x, y: d.y - vmean.y, z: d.z - vmean.z };
+      let frag = body({
+        name: b.name + " · " + (i + 1),
+        kind: "debris",
+        mass: m,
+        r: rad * 0.75,
+        x: b.x + q.x * b.r * 2.4,
+        y: b.y + q.y * b.r * 2.4,
+        z: b.z + q.z * b.r * 2.4,
+        vx: b.vx + q.x * spread,
+        vy: b.vy + q.y * spread,
+        vz: b.vz + q.z * spread,
+        color: b.color,
+        tidalDone: true,
+      });
+      if (i === 0) first = frag;
+    }
+    flash(b.x, b.y, b.z, b.color, 1.3);
+    event((tidal ? "Приливной разрыв: " : "Разрушение: ") + b.name);
+    if (selected === b.id) selected = first.id;
+    if (follow === b.id) follow = first.id;
+    removeBody(b, true);
+    syncFields();
+    return true;
+  }
+  function contacts() {
+    let did = false;
+    outer: for (let i = 0; i < bodies.length; i++) {
+      let a = bodies[i];
+      for (let j = i + 1; j < bodies.length; j++) {
+        let b = bodies[j],
+          dx = b.x - a.x,
+          dy = b.y - a.y,
+          dz = b.z - a.z,
+          r = Math.hypot(dx, dy, dz);
+        let hole = a.kind === "bh" ? a : b.kind === "bh" ? b : null;
+        let hit = hole
+          ? r <=
+            hole.r +
+              (a.kind === "bh" && b.kind === "bh" ? Math.min(a.r, b.r) : 0)
+          : r <= a.r + b.r;
+        if (hit && (settings.collision !== "none" || hole)) {
+          if (hole || settings.collision === "merge") {
+            merge(a, b);
+            did = true;
+            break outer;
+          }
+          let nx = r > 0 ? dx / r : 1,
+            ny = r > 0 ? dy / r : 0,
+            nz = r > 0 ? dz / r : 0,
+            dvx = b.vx - a.vx,
+            dvy = b.vy - a.vy,
+            dvz = b.vz - a.vz,
+            rel = dvx * nx + dvy * ny + dvz * nz;
+          let speed = Math.hypot(dvx, dvy, dvz),
+            esc = Math.sqrt(
+              (2 * G * (a.mass + b.mass)) / Math.max(a.r + b.r, settings.soft),
+            );
+          if (
+            settings.collision === "fragment" &&
+            speed > esc * 1.1 &&
+            bodies.length + 12 <= MAX &&
+            a.kind !== "debris" &&
+            b.kind !== "debris"
+          ) {
+            let sum = a.mass + b.mass;
+            let oldV = {
+              x: (a.vx * a.mass + b.vx * b.mass) / sum,
+              y: (a.vy * a.mass + b.vy * b.mass) / sum,
+              z: (a.vz * a.mass + b.vz * b.mass) / sum,
+            };
+            let k = 0.6;
+            for (let q of [a, b]) {
+              q.vx = oldV.x + (q.vx - oldV.x) * k;
+              q.vy = oldV.y + (q.vy - oldV.y) * k;
+              q.vz = oldV.z + (q.vz - oldV.z) * k;
+            }
+            splitBody(a, speed);
+            splitBody(b, speed);
+            did = true;
+            break outer;
+          }
+          if (settings.collision === "fragment") {
+            merge(a, b);
+            did = true;
+            break outer;
+          }
+          if (rel < 0) {
+            let impulse = (-2 * rel) / (1 / a.mass + 1 / b.mass);
+            a.vx -= (impulse * nx) / a.mass;
+            a.vy -= (impulse * ny) / a.mass;
+            a.vz -= (impulse * nz) / a.mass;
+            b.vx += (impulse * nx) / b.mass;
+            b.vy += (impulse * ny) / b.mass;
+            b.vz += (impulse * nz) / b.mass;
+            flash(a.x, a.y, a.z, "#b6ddff");
+            if (!a.lastBounce || t - a.lastBounce > 0.0000001) {
+              event("Отскок: " + a.name + " / " + b.name);
+              a.lastBounce = t;
+            }
+          }
+          let overlap = a.r + b.r - r;
+          let sum = a.mass + b.mass;
+          a.x -= (nx * overlap * b.mass) / sum;
+          a.y -= (ny * overlap * b.mass) / sum;
+          a.z -= (nz * overlap * b.mass) / sum;
+          b.x += (nx * overlap * a.mass) / sum;
+          b.y += (ny * overlap * a.mass) / sum;
+          b.z += (nz * overlap * a.mass) / sum;
+          baselineDirty = true;
+        } else if (hole && settings.tides) {
+          let other = hole === a ? b : a;
+          if (
+            !other.tidalDone &&
+            other.kind !== "bh" &&
+            other.kind !== "debris" &&
+            other.kind !== "asteroid"
+          ) {
+            let roche = other.r * Math.cbrt((2 * hole.mass) / other.mass);
+            if (
+              r < roche &&
+              r > hole.r * 1.1 &&
+              splitBody(other, 0, true, hole)
+            ) {
+              did = true;
+              break outer;
+            }
+          }
+        }
+      }
+    }
+    if (did) {
+      dirtyList = true;
+      baselineDirty = true;
+      pred = [];
+    }
+  }
+  function updateStats() {
+    let m = 0,
+      p = vec(),
+      co = vec(),
+      E = 0;
+    for (let b of bodies) {
+      m += b.mass;
+      p.x += b.mass * b.vx;
+      p.y += b.mass * b.vy;
+      p.z += b.mass * b.vz;
+      co.x += b.mass * b.x;
+      co.y += b.mass * b.y;
+      co.z += b.mass * b.z;
+      E += 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy + b.vz * b.vz);
+    }
+    for (let i = 0; i < bodies.length; i++)
+      for (let j = i + 1; j < bodies.length; j++) {
+        let a = bodies[i],
+          b = bodies[j];
+        E -=
+          (G * a.mass * b.mass) /
+          Math.sqrt(
+            (a.x - b.x) ** 2 +
+              (a.y - b.y) ** 2 +
+              (a.z - b.z) ** 2 +
+              settings.soft ** 2,
+          );
+      }
+    if (baselineDirty || energy0 === null) {
+      energy0 = E;
+      baselineDirty = false;
+    }
+    stats = {
+      mass: m,
+      p: len(p),
+      E,
+      drift: energy0 ? (E - energy0) / Math.abs(energy0) : 0,
+      com: m ? { x: co.x / m, y: co.y / m, z: co.z / m } : vec(),
+    };
+  }
+  function elements(b) {
+    let c = dominant(b);
+    if (!c || c.mass < b.mass * 0.01) return null;
+    let x = b.x - c.x,
+      y = b.y - c.y,
+      z = b.z - c.z,
+      vx = b.vx - c.vx,
+      vy = b.vy - c.vy,
+      vz = b.vz - c.vz,
+      r = Math.hypot(x, y, z),
+      mu = G * (c.mass + b.mass),
+      v2 = vx * vx + vy * vy + vz * vz,
+      energy = 0.5 * v2 - mu / r,
+      h2 =
+        (y * vz - z * vy) ** 2 +
+        (z * vx - x * vz) ** 2 +
+        (x * vy - y * vx) ** 2;
+    let a = -mu / (2 * energy),
+      e = Math.sqrt(Math.max(0, 1 + (2 * energy * h2) / (mu * mu)));
+    return { a, e, period: a > 0 ? TAU * Math.sqrt(a ** 3 / mu) : Infinity, c };
+  }
+  function luminosity(b) {
+    return b.kind === "star"
+      ? Math.pow(b.mass, b.mass < 0.43 ? 2.3 : b.mass > 2 ? 3.5 : 4) *
+          (b.mass < 0.43 ? 0.23 : 1)
+      : 0;
+  }
+  function temperature(b) {
+    if (b.kind === "star")
+      return 5772 * Math.pow(luminosity(b) / (b.r / 0.00465047) ** 2, 0.25);
+    let flux = 0;
+    for (let a of bodies)
+      if (a !== b && a.kind === "star") {
+        let r2 = (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2;
+        flux += luminosity(a) / Math.max(r2, a.r * a.r);
+      }
+    return Math.pow(278.3 ** 4 * flux * 0.7 + 2.725 ** 4, 0.25);
+  }
+  let rate = 0.02;
+  function setRate() {
+    rate = 10 ** Number($("timeRate").value);
+    $("rateLabel").textContent =
+      rate < 1 / 365.25
+        ? fmt(rate * YR, 1) + " с/с"
+        : rate < 1
+          ? fmt(rate * 365.25, 2) + " дн/с"
+          : fmt(rate, 2) + " лет/с";
+  }
+  $("timeRate").oninput = setRate;
+  function project(x, y, z) {
+    if (window.FoundryRenderer) return window.FoundryRenderer.project(x, y, z);
+    let dx = x - cam.x,
+      dy = y - cam.y,
+      dz = z - cam.z,
+      xx = dx * Math.cos(yaw) - dy * Math.sin(yaw),
+      yy = dx * Math.sin(yaw) + dy * Math.cos(yaw),
+      zz = yy * Math.sin(tilt) - dz * Math.cos(tilt),
+      yp = yy * Math.cos(tilt) + dz * Math.sin(tilt);
+    let k = 1 / (1 + Math.max(-0.5, Math.min(2, (zz * scale) / 1800)));
+    return {
+      x: W / 2 + xx * scale * k,
+      y: H / 2 - yp * scale * k,
+      depth: zz,
+      k,
+    };
+  }
+  function unproject(px, py, z = 0) {
+    if (window.FoundryRenderer)
+      return window.FoundryRenderer.unproject(px, py, z);
+    let u = (px - W / 2) / scale,
+      v = -(py - H / 2) / scale,
+      dz = z - cam.z;
+    let denom = Math.cos(tilt) - (v * scale * Math.sin(tilt)) / 1800;
+    let yy =
+      (v * (1 - (dz * Math.cos(tilt) * scale) / 1800) - dz * Math.sin(tilt)) /
+      denom;
+    let k =
+        1 / (1 + ((yy * Math.sin(tilt) - dz * Math.cos(tilt)) * scale) / 1800),
+      xx = u / k;
+    return {
+      x: cam.x + xx * Math.cos(yaw) + yy * Math.sin(yaw),
+      y: cam.y - xx * Math.sin(yaw) + yy * Math.cos(yaw),
+      z,
+    };
+  }
+  function screenRadius(b, p) {
+    if (window.FoundryRenderer) return window.FoundryRenderer.radius(b);
+    let vr;
+    if (b.kind === "star") vr = 9 + Math.pow(Math.max(0.01, b.mass), 0.22) * 5;
+    else if (b.kind === "bh") vr = Math.max(17, b.r * scale * p.k);
+    else if (b.kind === "gas") vr = 8 + Math.pow(b.mass / 0.0009543, 0.2) * 3;
+    else if (b.kind === "debris" || b.kind === "asteroid")
+      vr = 1.5 + Math.min(2, b.r * scale * p.k);
+    else vr = 5 + Math.pow(b.mass / 3e-6, 0.22) * 1.5;
+    return Math.max(
+      b.r * scale * p.k,
+      vr * Number($("sizeScale").value) * Math.pow(p.k, 0.3),
+    );
+  }
+  function pathWorld(points, color, width = 1, dash = []) {
+    if (points.length < 2) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    points.forEach((v, i) => {
+      let p = project(v.x, v.y, v.z);
+      if (i) ctx.lineTo(p.x, p.y);
+      else ctx.moveTo(p.x, p.y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  function circleWorld(x, y, z, r, color, width = 1) {
+    let pts = [];
+    for (let i = 0; i <= 100; i++) {
+      let a = (i / 100) * TAU;
+      pts.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, z });
+    }
+    pathWorld(pts, color, width);
+  }
+  function updateFieldUI() {
+    $("fieldBtn").classList.toggle("active", $("curvature").checked);
+    $("fieldValue").textContent = $("fieldStrength").value + "×";
+  }
+  $("fieldBtn").onclick = () => {
+    $("curvature").checked = !$("curvature").checked;
+    updateFieldUI();
+  };
+  $("curvature").onchange = updateFieldUI;
+  $("fieldStrength").oninput = updateFieldUI;
+  function prepareField() {
+    let visible = bodies
+      .filter((b) => {
+        let p = project(b.x, b.y, b.z);
+        return p.x > -200 && p.x < W + 200 && p.y > -200 && p.y < H + 200;
+      })
+      .sort((a, b) => b.mass - a.mass)
+      .slice(0, 12);
+    let max = visible[0]?.mass || 1;
+    fieldSources = visible.map((b) => ({
+      x: b.x,
+      y: b.y,
+      mass: b.mass,
+      w: Math.max(b.r, (38 + 28 * Math.sqrt(b.mass / max)) / scale),
+    }));
+    let norm = fieldSources.reduce(
+      (v, b) => Math.max(v, (G * b.mass) / b.w),
+      1e-30,
+    );
+    return norm;
+  }
+  function fieldHeight(x, y, norm) {
+    let potential = 0;
+    for (let b of fieldSources)
+      potential +=
+        (G * b.mass) / Math.sqrt((x - b.x) ** 2 + (y - b.y) ** 2 + b.w * b.w);
+    return (
+      ((-Number($("fieldStrength").value) * 65) / scale) *
+      Math.min(3, potential / norm)
+    );
+  }
+  function flammHeight(r, rs, outer, amplification) {
+    return amplification * 2 * Math.sqrt(rs * Math.max(0, r - rs));
+  }
+  function drawCurvature() {
+    let amp = Number($("fieldStrength").value),
+      bh = bodies
+        .filter((b) => b.kind === "bh")
+        .sort((a, b) => b.mass - a.mass)[0];
+    if ($("fieldMode").value === "schwarzschild" && bh) {
+      let rs = bh.r,
+        outer = Math.max(rs * 12, 240 / scale),
+        rings = 28,
+        spokes = 48;
+      let points = [];
+      for (let i = rings; i >= 0; i--) {
+        let u = i / rings,
+          r = rs + (outer - rs) * u * u,
+          z = bh.z + flammHeight(r, rs, outer, amp);
+        let pts = [];
+        for (let j = 0; j <= 96; j++) {
+          let a = (j / 96) * TAU;
+          pts.push({ x: bh.x + r * Math.cos(a), y: bh.y + r * Math.sin(a), z });
+        }
+        pathWorld(
+          pts,
+          i === 0 ? "#f4c58ad0" : i < 8 ? "#c3a8ec87" : "#879fcb48",
+          i === 0 ? 1.6 : 0.7,
+        );
+      }
+      for (let j = 0; j < spokes; j++) {
+        let a = (j / spokes) * TAU,
+          pts = [];
+        for (let i = 0; i <= 60; i++) {
+          let r = rs + (outer - rs) * (i / 60) ** 2;
+          pts.push({
+            x: bh.x + r * Math.cos(a),
+            y: bh.y + r * Math.sin(a),
+            z: bh.z + flammHeight(r, rs, outer, amp),
+          });
+        }
+        pathWorld(pts, "#a3b2d559", 0.7);
+      }
+      $("fieldCaption").innerHTML =
+        "<b>Срез Шварцшильда · одна ЧД</b><br>Поверхность Фламма · высота ×" +
+        fmt(amp, 1) +
+        " · " +
+        (settings.rel ? "Ньютон + прецессия" : "движение: Ньютон");
+      return;
+    }
+    let norm = prepareField();
+    if (!fieldSources.length) {
+      if ($("grid").checked) drawGrid();
+      $("fieldCaption").textContent = "Поле пусто — добавьте массивное тело.";
+      return;
+    }
+    let spacing = 10 ** Math.floor(Math.log10(55 / scale)),
+      pix = spacing * scale;
+    if (pix < 24) spacing *= 5;
+    else if (pix < 45) spacing *= 2;
+    let ext = (Math.max(W, H) / scale) * 0.85,
+      n = Math.min(19, Math.ceil(ext / spacing)),
+      cx = Math.round(cam.x / spacing) * spacing,
+      cy = Math.round(cam.y / spacing) * spacing;
+    for (let i = -n; i <= n; i++) {
+      let p1 = [],
+        p2 = [];
+      for (let j = 0; j <= 64; j++) {
+        let v = -ext + (j / 64) * ext * 2,
+          x = cx + i * spacing,
+          y = cy + v;
+        p1.push({ x, y, z: fieldHeight(x, y, norm) });
+        x = cx + v;
+        y = cy + i * spacing;
+        p2.push({ x, y, z: fieldHeight(x, y, norm) });
+      }
+      pathWorld(p1, i % 5 === 0 ? "#8da8d368" : "#617da340", 0.7);
+      pathWorld(p2, i % 5 === 0 ? "#8da8d368" : "#617da340", 0.7);
+    }
+    for (let b of fieldSources.slice(0, 5)) {
+      if (b.mass < (fieldSources[0]?.mass || 1) * 0.001) continue;
+      let z = fieldHeight(b.x, b.y, norm);
+      pathWorld(
+        [
+          { x: b.x, y: b.y, z: 0 },
+          { x: b.x, y: b.y, z },
+        ],
+        "#c6b0ed50",
+        0.7,
+        [2, 5],
+      );
+      circleWorld(b.x, b.y, z, b.w * 0.42, "#c4a3ef75", 0.8);
+    }
+    $("fieldCaption").innerHTML =
+      "<b>Гравитационные колодцы · карта потенциала</b><br>Глубина и сглаживание визуальные · силы не изменены";
+  }
+  function drawGrid() {
+    let spacing = 10 ** Math.floor(Math.log10(95 / scale)),
+      pix = spacing * scale;
+    if (pix < 48) spacing *= 5;
+    else if (pix < 85) spacing *= 2;
+    let ext = (Math.max(W, H) / scale) * 1.4;
+    let cx = Math.round(cam.x / spacing) * spacing,
+      cy = Math.round(cam.y / spacing) * spacing;
+    let n = Math.min(24, Math.ceil(ext / spacing));
+    for (let i = -n; i <= n; i++) {
+      let x = cx + i * spacing,
+        y = cy + i * spacing;
+      pathWorld(
+        [
+          { x, y: cy - ext, z: 0 },
+          { x, y: cy + ext, z: 0 },
+        ],
+        Math.abs(x) < spacing * 0.01 ? "#3a506552" : "#20344748",
+      );
+      pathWorld(
+        [
+          { x: cx - ext, y, z: 0 },
+          { x: cx + ext, y, z: 0 },
+        ],
+        Math.abs(y) < spacing * 0.01 ? "#3a506552" : "#20344748",
+      );
+    }
+    let q = project(0, 0, 0);
+    ctx.strokeStyle = "#7096b280";
+    ctx.beginPath();
+    ctx.moveTo(q.x - 4, q.y);
+    ctx.lineTo(q.x + 4, q.y);
+    ctx.moveTo(q.x, q.y - 4);
+    ctx.lineTo(q.x, q.y + 4);
+    ctx.stroke();
+  }
+  function drawBackground(now) {
+    ctx.fillStyle = "#070d17";
+    ctx.fillRect(0, 0, W, H);
+    let g = ctx.createRadialGradient(
+      W * 0.53,
+      H * 0.43,
+      0,
+      W * 0.53,
+      H * 0.43,
+      W * 0.65,
+    );
+    g.addColorStop(0, "#0c1b2e");
+    g.addColorStop(0.55, "#09101e");
+    g.addColorStop(1, "#050911");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    let holes = $("lensing").checked
+      ? bodies
+          .filter((b) => b.kind === "bh")
+          .slice(0, 4)
+          .map((b) => {
+            let p = project(b.x, b.y, b.z);
+            return { x: p.x, y: p.y, re: screenRadius(b, p) * 2.5 };
+          })
+      : [];
+    for (let s of stars) {
+      let x = (((s.x * W + yaw * 35) % W) + W) % W,
+        y = (((s.y * H + tilt * 18) % H) + H) % H,
+        secondary = null;
+      for (let h of holes) {
+        let dx = x - h.x,
+          dy = y - h.y,
+          beta = Math.hypot(dx, dy);
+        if (beta > h.re * 6 || beta < 0.001) continue;
+        let root = Math.sqrt(beta * beta + 4 * h.re * h.re),
+          plus = (beta + root) / 2,
+          minus = (beta - root) / 2;
+        secondary = {
+          x: h.x + (dx / beta) * minus,
+          y: h.y + (dy / beta) * minus,
+          a: Math.min(0.6, ((h.re * h.re) / (beta * beta + 1)) * 0.18),
+        };
+        x = h.x + (dx / beta) * plus;
+        y = h.y + (dy / beta) * plus;
+      }
+      ctx.fillStyle =
+        s.c > 0.8
+          ? "rgba(161,193,233," + s.a + ")"
+          : "rgba(216,225,240," + s.a + ")";
+      ctx.beginPath();
+      ctx.arc(x, y, s.s, 0, TAU);
+      ctx.fill();
+      if (secondary) {
+        ctx.fillStyle = "rgba(200,189,238," + secondary.a + ")";
+        ctx.beginPath();
+        ctx.arc(secondary.x, secondary.y, s.s * 0.85, 0, TAU);
+        ctx.fill();
+      }
+    }
+  }
 
-'use strict';
-(()=>{
-const G=4*Math.PI*Math.PI, AU=149597870.7, MS=1.98847e30, YR=31557600, VUNIT=AU/YR, C=299792.458/VUNIT, MAX=180, TAU=2*Math.PI;
-const $=id=>document.getElementById(id), cv=$('space'), ctx=cv.getContext('2d',{alpha:true});
-const presets={earth:{name:'Планета',kind:'rock',mass:3.003e-6,r:6371/AU,color:'#72b9e4'},gas:{name:'Гигант',kind:'gas',mass:.0009543,r:69911/AU,color:'#dbb78c'},moon:{name:'Спутник',kind:'rock',mass:3.694e-8,r:1737.4/AU,color:'#bbb9b1'},star:{name:'Звезда',kind:'star',mass:1,r:695700/AU,color:'#ffcf85'},bh:{name:'Чёрная дыра',kind:'bh',mass:10,r:2*G*10/(C*C),color:'#eda671'},asteroid:{name:'Астероид',kind:'asteroid',mass:1e-12,r:50/AU,color:'#a5a2a0'}};
-let bodies=[],nextId=1,selected=null,follow=null,t=0,paused=false,tool='select',scenario='solar',energy0=null,steps=0,lastFPS=60,limited=false;
-let W=innerWidth,H=innerHeight,dpr=Math.min(devicePixelRatio||1,2),yaw=-.28,tilt=.52,scale=100,cam={x:0,y:0,z:0},targetScale=100;
-let pointer=null,mouse={x:0,y:0},hover=null,dirtyList=true,events=[],effects=[],pred=[],lastPred=0,baselineDirty=true;
-let orbitAnchor=null;
-let launchPath=[],launchPathTime=0,launchPathStamp='',fieldSources=[];
-let settings={collision:'merge',accuracy:.035,soft:1e-6,tides:true,rel:false};
-let stats={mass:0,p:0,E:0,drift:0,com:{x:0,y:0,z:0}};
-const kinds={star:'Звезда',rock:'Каменистое тело',gas:'Газовый гигант',bh:'Чёрная дыра',asteroid:'Астероид',debris:'Обломок'};
-let seed=23849;function rand(){seed=(1664525*seed+1013904223)>>>0;return seed/4294967296}
-const stars=Array.from({length:680},()=>({x:rand(),y:rand(),s:.3+rand()*1.2,a:.12+rand()*.6,c:rand()}));
-function resize(){W=innerWidth;H=innerHeight;dpr=Math.min(devicePixelRatio||1,2);cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);cv.style.width=W+'px';cv.style.height=H+'px';ctx.setTransform(dpr,0,0,dpr,0,0)}addEventListener('resize',resize);resize();
-function fmt(n,d=2){if(!Number.isFinite(n))return '—';if(n!==0&&(Math.abs(n)<.001||Math.abs(n)>=1e6))return n.toExponential(2);return n.toLocaleString('ru-RU',{maximumFractionDigits:d})}
-function vec(x=0,y=0,z=0){return {x,y,z}}function len(v){return Math.hypot(v.x,v.y,v.z)}
-function body(o){let b={id:nextId++,name:'Тело',kind:'rock',mass:3e-6,r:6371/AU,x:0,y:0,z:0,vx:0,vy:0,vz:0,ax:0,ay:0,az:0,color:'#80c8ea',trail:[],tidalDone:false,...o};if(b.kind==='bh')b.r=2*G*b.mass/(C*C);bodies.push(b);dirtyList=true;baselineDirty=true;return b}
-function getSelected(){return bodies.find(b=>b.id===selected)}
-function notify(text){$('toast').textContent=text;$('toast').classList.add('show');clearTimeout(notify.timer);notify.timer=setTimeout(()=>$('toast').classList.remove('show'),3400)}
-function event(text){events.unshift({t,text});events=events.slice(0,45);$('events').replaceChildren(...events.slice(0,22).map(e=>{let d=document.createElement('div');d.className='event';let tm=document.createElement('time');tm.textContent=fmt(e.t,3)+' г.';d.append(tm,document.createTextNode(e.text));return d}))}
-function select(b){selected=b?b.id:null;syncFields();dirtyList=true;pred=[];lastPred=0}
-function syncFields(){let b=getSelected();for(const id of ['editName','editMass','editRadius','editVx','editVy','editVz','editColor','applyBtn','followBtn','focusBtn','circularBtn','removeBtn','prograde','retrograde'])$(id).disabled=!b;if(!b){for(let id of ['editName','editMass','editRadius','editVx','editVy','editVz'])$(id).value='';$('editColor').value='#53657a';$('bodySwatch').style.background='#53657a';$('bodyName').textContent='Ничего не выбрано';$('bodyKind').textContent='Щёлкните по телу';$('bodyId').textContent='';updateLaunchNote();return}$('bodyName').textContent=b.name;$('bodyKind').textContent=kinds[b.kind]||'Тело';$('bodyId').textContent='#'+b.id;$('bodySwatch').style.background=b.color;$('editName').value=b.name;$('editMass').value=+b.mass.toPrecision(7);$('editRadius').value=+(b.r*AU).toPrecision(7);$('editRadius').disabled=b.kind==='bh';$('editVx').value=+(b.vx*VUNIT).toFixed(5);$('editVy').value=+(b.vy*VUNIT).toFixed(5);$('editVz').value=+(b.vz*VUNIT).toFixed(5);$('editColor').value=b.color;$('followBtn').classList.toggle('active',follow===b.id);updateLaunchNote()}
-function centerMomentum(){let m=0,p=vec(),c=vec();for(let b of bodies){m+=b.mass;p.x+=b.mass*b.vx;p.y+=b.mass*b.vy;p.z+=b.mass*b.vz;c.x+=b.mass*b.x;c.y+=b.mass*b.y;c.z+=b.mass*b.z}if(!m)return;for(let b of bodies){b.vx-=p.x/m;b.vy-=p.y/m;b.vz-=p.z/m;b.x-=c.x/m;b.y-=c.y/m;b.z-=c.z/m;b.trail=[]}cam=vec();baselineDirty=true}
-function dominant(b){let best=null,max=0;for(let a of bodies){if(a===b)continue;let q=a.mass/((a.x-b.x)**2+(a.y-b.y)**2+(a.z-b.z)**2+settings.soft**2);if(q>max){max=q;best=a}}return best}
-function orbitVel(b,c,inclination=0){let x=b.x-c.x,y=b.y-c.y,z=b.z-c.z,r=Math.hypot(x,y,z);if(!r)return null;let h=Math.hypot(x,y),tx=h>1e-12?-y/h:1,ty=h>1e-12?x/h:0;let v=Math.sqrt(G*(b.mass+c.mass)*r*r/Math.pow(r*r+settings.soft**2,1.5));return {vx:tx*v*Math.cos(inclination),vy:ty*v*Math.cos(inclination),vz:v*Math.sin(inclination)}}
-function setCircular(b,c){let v=orbitVel(b,c);if(!v)return; b.vx=c.vx+v.vx;b.vy=c.vy+v.vy;b.vz=c.vz+v.vz;baselineDirty=true;syncFields()}
-function orbitBody(c,p,d,a,extra={}){let b=body({...p,x:c.x+d*Math.cos(a),y:c.y+d*Math.sin(a),z:0,...extra});let v=orbitVel(b,c,extra.inc||0);b.vx=c.vx+v.vx;b.vy=c.vy+v.vy;b.vz=c.vz+v.vz;return b}
-const scenes={
-solar:{title:'Солнечная система',short:'Солнечная',desc:'Восемь планет. Реальные массы и полуоси, почти круговые начальные орбиты.',rate:-1.5,build(){let sun=body({...presets.star,name:'Солнце'});let data=[['Меркурий',1.660e-7,2439.7,.387,'#bcaaa0'],['Венера',2.447e-6,6051.8,.723,'#e6bd83'],['Земля',3.003e-6,6371,1,'#79bde8'],['Марс',3.227e-7,3389.5,1.524,'#e79776'],['Юпитер',.0009543,69911,5.203,'#d5b18b'],['Сатурн',.0002857,58232,9.537,'#e0cca2'],['Уран',.00004365,25362,19.19,'#96dbdc'],['Нептун',.00005149,24622,30.07,'#6d95e0']];data.forEach((d,i)=>orbitBody(sun,{name:d[0],mass:d[1],r:d[2]/AU,color:d[4],kind:i>3?'gas':'rock',ring:i===5},d[3],i*2.31+.8,{inc:i===0?.07:0}));select(bodies[3]);scale=targetScale=Math.min((W-640)/4.8,(H-240)/3.3);cam=vec();},zoom:3},
-binary:{title:'Двойное солнце',short:'Две звезды',desc:'Тесная звёздная пара и циркумбинарные планеты. Устойчивость не гарантирована.',rate:-1.6,build(){let a=body({...presets.star,mass:1.1,r:.0049,name:'Альфа',x:-.35,color:'#ffd19b'});let b=body({...presets.star,mass:.7,r:.0036,name:'Бета',x:.55,color:'#a8ceff'});let w=Math.sqrt(G*1.8/.9**3);a.vy=-.35*w;b.vy=.55*w;let proxy={x:0,y:0,z:0,vx:0,vy:0,vz:0,mass:1.8};orbitBody(proxy,presets.earth,2.8,1.4,{name:'Кеплер',inc:.08});orbitBody(proxy,presets.gas,4.7,3.1,{name:'Гелиос'});select(a);scale=targetScale=Math.min((W-640)/10,(H-220)/7);cam=vec()}},
-blackhole:{title:'На краю горизонта',short:'Чёрная дыра',desc:'ЧД массой 1 000 000 M☉. Приливной разрыв, аккреция и быстрые близкие орбиты.',rate:-4.3,build(){let h=body({...presets.bh,mass:1e6,name:'Сингулярность'});orbitBody(h,{...presets.star,mass:1.2,name:'S‑1',color:'#c1ddff'},1.5,.3,{inc:.3});orbitBody(h,{...presets.star,mass:.6,r:.003,name:'S‑2',color:'#ffcc9a'},2.8,2.5,{inc:-.25});let p=orbitBody(h,presets.earth,.65,3.4,{name:'Икар'});p.vx*=.13;p.vy*=.13;for(let i=0;i<24;i++)orbitBody(h,{...presets.asteroid,mass:1e-10,name:'Частица '+(i+1),kind:'debris'},.23+rand()*.5,rand()*TAU,{inc:(rand()-.5)*.15});select(p);scale=targetScale=Math.min((W-640)/6.5,(H-220)/4.8);cam=vec()}},
-collision:{title:'Удар миров',short:'Столкновение',desc:'Две землеподобные планеты на встречных траекториях. Смените модель контакта.',rate:-4.5,build(){let r=6371/AU;body({...presets.earth,name:'Тея',mass:1.8e-6,r:r*.85,x:-.00038,y:.000008,vx:1.0,color:'#df9276'});body({...presets.earth,name:'Гея',x:.00038,y:-.000008,vx:-.6,color:'#85c9ea'});select(bodies[1]);scale=targetScale=Math.min((W-640)/.0014,(H-220)/.001);cam=vec()}},
-cluster:{title:'Гравитационный хаос',short:'Скопление',desc:'36 взаимно тяготеющих звёзд: коллапс, выбросы и случайное рождение двойных.',rate:-1.3,build(){for(let i=0;i<36;i++){let a=rand()*TAU,r=1.2+Math.sqrt(rand())*6,m=.15+rand()*1.8;body({...presets.star,name:'Звезда '+String(i+1).padStart(2,'0'),mass:m,r:.00465*Math.pow(m,.7),x:Math.cos(a)*r,y:Math.sin(a)*r,z:(rand()-.5)*3,vx:(rand()-.5)*1.8,vy:(rand()-.5)*1.8,vz:(rand()-.5),color:m>1?'#bfd9ff':'#ffcd98'})}select(bodies[0]);scale=targetScale=Math.min((W-640)/21,(H-220)/15);cam=vec()}},
-empty:{title:'Чистый лист',short:'Пустота',desc:'Ни одного тела. Создайте звезду, затем добавьте планеты инструментом «На орбиту».',rate:-1.7,build(){select(null);scale=targetScale=130;cam=vec()}}
-};
-function loadScene(key,ask=true){if(ask&&!confirm('Заменить текущую систему сценарием «'+scenes[key].title+'»? Несохранённые изменения исчезнут.'))return;clearTimeout(notify.timer);$('toast').classList.remove('show');scenario=key;orbitAnchor=null;bodies=[];nextId=1;selected=null;follow=null;t=0;events=[];effects=[];pred=[];energy0=null;settings.rel=key==='blackhole';$('grRel').checked=settings.rel;$('fieldMode').value=key==='blackhole'?'schwarzschild':'potential';updateFieldUI();yaw=-.28;tilt=.52;$('view3d').classList.add('active');$('viewTop').classList.remove('active');paused=false;pointer=null;seed=23849;scenes[key].build();centerMomentum();$('timeRate').value=scenes[key].rate;setRate();setTool('select');$('scenarioTitle').textContent=scenes[key].title;$('scenarioDesc').textContent=scenes[key].desc;document.querySelectorAll('[data-scene]').forEach(b=>b.classList.toggle('active',b.dataset.scene===key));event('Загружен сценарий: '+scenes[key].title);accel(bodies);syncFields();updateStats();uiUpdate();updatePause()}
-for(let [key,s]of Object.entries(scenes)){let btn=document.createElement('button');btn.textContent=s.short;btn.dataset.scene=key;btn.onclick=()=>loadScene(key);$('scenarios').append(btn)}
-function accel(arr){for(let b of arr){b.ax=0;b.ay=0;b.az=0}let eps2=settings.soft*settings.soft;for(let i=0;i<arr.length;i++){let a=arr[i];for(let j=i+1;j<arr.length;j++){let b=arr[j],x=b.x-a.x,y=b.y-a.y,z=b.z-a.z,r2=x*x+y*y+z*z+eps2,inv=G/(r2*Math.sqrt(r2)),cor=1;if(settings.rel&&(a.kind==='bh'||b.kind==='bh')){let vx=b.vx-a.vx,vy=b.vy-a.vy,vz=b.vz-a.vz,h2=(y*vz-z*vy)**2+(z*vx-x*vz)**2+(x*vy-y*vx)**2;cor+=3*h2/(r2*C*C)}let f=inv*cor;a.ax+=x*f*b.mass;a.ay+=y*f*b.mass;a.az+=z*f*b.mass;b.ax-=x*f*a.mass;b.ay-=y*f*a.mass;b.az-=z*f*a.mass}}}
-function safeStep(arr=bodies){let dt=Infinity,e=settings.soft**2;for(let i=0;i<arr.length;i++){let a=arr[i];for(let j=i+1;j<arr.length;j++){let b=arr[j],r2=(a.x-b.x)**2+(a.y-b.y)**2+(a.z-b.z)**2,r=Math.sqrt(r2),v=Math.hypot(a.vx-b.vx,a.vy-b.vy,a.vz-b.vz);let dynam=settings.accuracy*Math.sqrt(Math.pow(r2+e,1.5)/(G*(a.mass+b.mass)));if(dynam<dt)dt=dynam;let crossing=.12*Math.max(r,settings.soft)/(v+1e-25);if(crossing<dt)dt=crossing}}return dt}
-function leap(dt,arr){accel(arr);for(let b of arr){b.vx+=b.ax*dt*.5;b.vy+=b.ay*dt*.5;b.vz+=b.az*dt*.5;b.x+=b.vx*dt;b.y+=b.vy*dt;b.z+=b.vz*dt}accel(arr);for(let b of arr){b.vx+=b.ax*dt*.5;b.vy+=b.ay*dt*.5;b.vz+=b.az*dt*.5}}
-function simulate(wanted){let rem=wanted;steps=0;limited=false;let start=performance.now();while(rem>1e-15&&steps<180){let dt=Math.min(rem,safeStep(),.02);if(!(dt>0)||!Number.isFinite(dt)){paused=true;notify('Интегратор остановлен: недопустимый шаг.');break}leap(dt,bodies);t+=dt;rem-=dt;contacts();steps++;if(steps%6===0&&performance.now()-start>15)break}limited=rem>wanted*.05;return wanted-rem}
-function removeBody(b,silent=false){bodies=bodies.filter(x=>x!==b);if(selected===b.id)select(null);if(follow===b.id)follow=null;dirtyList=true;baselineDirty=true;pred=[];if(!silent)event('Удалено: '+b.name)}
-function flash(x,y,z,color,size=1){effects.push({x,y,z,color,age:0,size})}
-function merge(a,b){let m=a.mass+b.mass,keep=a.mass>=b.mass?a:b,drop=keep===a?b:a;let x=(a.x*a.mass+b.x*b.mass)/m,y=(a.y*a.mass+b.y*b.mass)/m,z=(a.z*a.mass+b.z*b.mass)/m;let bh=a.kind==='bh'||b.kind==='bh';flash(x,y,z,bh?'#fbc58c':'#ffe2b2',bh?1:2);keep.x=x;keep.y=y;keep.z=z;keep.vx=(a.vx*a.mass+b.vx*b.mass)/m;keep.vy=(a.vy*a.mass+b.vy*b.mass)/m;keep.vz=(a.vz*a.mass+b.vz*b.mass)/m;keep.r=Math.cbrt(a.r**3+b.r**3);keep.mass=m;if(bh){keep.kind='bh';keep.r=2*G*m/(C*C);keep.color='#eda671'}else{keep.name=keep.name+' +';keep.trail=[]}event((bh?'Поглощение: ':'Слияние: ')+drop.name+' → '+keep.name);if(selected===drop.id)selected=keep.id;if(follow===drop.id)follow=keep.id;removeBody(drop,true);syncFields();return keep}
-function splitBody(b,relativeSpeed=0,tidal=false,hole=null){if(bodies.length+6>MAX||b.mass<1e-14)return false;let n=7,m=b.mass/n,rad=b.r/Math.cbrt(n),dir=[],vmean=vec();for(let i=0;i<n;i++){let a=TAU*i/n,d={x:Math.cos(a),y:Math.sin(a),z:(i%2?1:-1)*.35};dir.push(d);vmean.x+=d.x/n;vmean.y+=d.y/n;vmean.z+=d.z/n}let spread=Math.max(relativeSpeed*.16,Math.sqrt(2*G*b.mass/Math.max(b.r,settings.soft))*.12);let first=null;for(let i=0;i<n;i++){let d=dir[i],q={x:d.x-vmean.x,y:d.y-vmean.y,z:d.z-vmean.z};let frag=body({name:b.name+' · '+(i+1),kind:'debris',mass:m,r:rad*.75,x:b.x+q.x*b.r*2.4,y:b.y+q.y*b.r*2.4,z:b.z+q.z*b.r*2.4,vx:b.vx+q.x*spread,vy:b.vy+q.y*spread,vz:b.vz+q.z*spread,color:b.color,tidalDone:true});if(i===0)first=frag}flash(b.x,b.y,b.z,b.color,1.3);event((tidal?'Приливной разрыв: ':'Разрушение: ')+b.name);if(selected===b.id)selected=first.id;if(follow===b.id)follow=first.id;removeBody(b,true);syncFields();return true}
-function contacts(){let did=false;outer:for(let i=0;i<bodies.length;i++){let a=bodies[i];for(let j=i+1;j<bodies.length;j++){let b=bodies[j],dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z,r=Math.hypot(dx,dy,dz);let hole=a.kind==='bh'?a:b.kind==='bh'?b:null;let hit=hole? r<=hole.r+(a.kind==='bh'&&b.kind==='bh'?Math.min(a.r,b.r):0):r<=a.r+b.r;
-if(hit&&(settings.collision!=='none'||hole)){if(hole||settings.collision==='merge'){merge(a,b);did=true;break outer}let nx=r>0?dx/r:1,ny=r>0?dy/r:0,nz=r>0?dz/r:0,dvx=b.vx-a.vx,dvy=b.vy-a.vy,dvz=b.vz-a.vz,rel=dvx*nx+dvy*ny+dvz*nz;let speed=Math.hypot(dvx,dvy,dvz),esc=Math.sqrt(2*G*(a.mass+b.mass)/Math.max(a.r+b.r,settings.soft));if(settings.collision==='fragment'&&speed>esc*1.1&&bodies.length+12<=MAX&&a.kind!=='debris'&&b.kind!=='debris'){let sum=a.mass+b.mass;let oldV={x:(a.vx*a.mass+b.vx*b.mass)/sum,y:(a.vy*a.mass+b.vy*b.mass)/sum,z:(a.vz*a.mass+b.vz*b.mass)/sum};let k=.6;for(let q of [a,b]){q.vx=oldV.x+(q.vx-oldV.x)*k;q.vy=oldV.y+(q.vy-oldV.y)*k;q.vz=oldV.z+(q.vz-oldV.z)*k}splitBody(a,speed);splitBody(b,speed);did=true;break outer}
-if(settings.collision==='fragment'){merge(a,b);did=true;break outer}
-if(rel<0){let impulse=-2*rel/(1/a.mass+1/b.mass);a.vx-=impulse*nx/a.mass;a.vy-=impulse*ny/a.mass;a.vz-=impulse*nz/a.mass;b.vx+=impulse*nx/b.mass;b.vy+=impulse*ny/b.mass;b.vz+=impulse*nz/b.mass;flash(a.x,a.y,a.z,'#b6ddff');if(!a.lastBounce||t-a.lastBounce>.0000001){event('Отскок: '+a.name+' / '+b.name);a.lastBounce=t}}let overlap=a.r+b.r-r;let sum=a.mass+b.mass;a.x-=nx*overlap*b.mass/sum;a.y-=ny*overlap*b.mass/sum;a.z-=nz*overlap*b.mass/sum;b.x+=nx*overlap*a.mass/sum;b.y+=ny*overlap*a.mass/sum;b.z+=nz*overlap*a.mass/sum;baselineDirty=true;
-}else if(hole&&settings.tides){let other=hole===a?b:a;if(!other.tidalDone&&other.kind!=='bh'&&other.kind!=='debris'&&other.kind!=='asteroid'){let roche=other.r*Math.cbrt(2*hole.mass/other.mass);if(r<roche&&r>hole.r*1.1&&splitBody(other,0,true,hole)){did=true;break outer}}}
-}}if(did){dirtyList=true;baselineDirty=true;pred=[]}}
-function updateStats(){let m=0,p=vec(),co=vec(),E=0;for(let b of bodies){m+=b.mass;p.x+=b.mass*b.vx;p.y+=b.mass*b.vy;p.z+=b.mass*b.vz;co.x+=b.mass*b.x;co.y+=b.mass*b.y;co.z+=b.mass*b.z;E+=.5*b.mass*(b.vx*b.vx+b.vy*b.vy+b.vz*b.vz)}for(let i=0;i<bodies.length;i++)for(let j=i+1;j<bodies.length;j++){let a=bodies[i],b=bodies[j];E-=G*a.mass*b.mass/Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2+(a.z-b.z)**2+settings.soft**2)}if(baselineDirty||energy0===null){energy0=E;baselineDirty=false}stats={mass:m,p:len(p),E,drift:energy0? (E-energy0)/Math.abs(energy0):0,com:m?{x:co.x/m,y:co.y/m,z:co.z/m}:vec()}}
-function elements(b){let c=dominant(b);if(!c||c.mass<b.mass*.01)return null;let x=b.x-c.x,y=b.y-c.y,z=b.z-c.z,vx=b.vx-c.vx,vy=b.vy-c.vy,vz=b.vz-c.vz,r=Math.hypot(x,y,z),mu=G*(c.mass+b.mass),v2=vx*vx+vy*vy+vz*vz,energy=.5*v2-mu/r,h2=(y*vz-z*vy)**2+(z*vx-x*vz)**2+(x*vy-y*vx)**2;let a=-mu/(2*energy),e=Math.sqrt(Math.max(0,1+2*energy*h2/(mu*mu)));return{a,e,period:a>0?TAU*Math.sqrt(a**3/mu):Infinity,c}}
-function luminosity(b){return b.kind==='star'?Math.pow(b.mass,b.mass<.43?2.3:b.mass>2?3.5:4)*(b.mass<.43?.23:1):0}
-function temperature(b){if(b.kind==='star')return 5772*Math.pow(luminosity(b)/(b.r/.00465047)**2,.25);let flux=0;for(let a of bodies)if(a!==b&&a.kind==='star'){let r2=(a.x-b.x)**2+(a.y-b.y)**2+(a.z-b.z)**2;flux+=luminosity(a)/Math.max(r2,a.r*a.r)}return Math.pow(278.3**4*flux*.7+2.725**4,.25)}
-let rate=.02;function setRate(){rate=10**Number($('timeRate').value);$('rateLabel').textContent=rate<1/365.25?fmt(rate*YR,1)+' с/с':rate<1?fmt(rate*365.25,2)+' дн/с':fmt(rate,2)+' лет/с'}$('timeRate').oninput=setRate;
-function project(x,y,z){if(window.FoundryRenderer)return window.FoundryRenderer.project(x,y,z);let dx=x-cam.x,dy=y-cam.y,dz=z-cam.z,xx=dx*Math.cos(yaw)-dy*Math.sin(yaw),yy=dx*Math.sin(yaw)+dy*Math.cos(yaw),zz=yy*Math.sin(tilt)-dz*Math.cos(tilt),yp=yy*Math.cos(tilt)+dz*Math.sin(tilt);let k=1/(1+Math.max(-.5,Math.min(2,zz*scale/1800)));return{x:W/2+xx*scale*k,y:H/2-yp*scale*k,depth:zz,k}}
-function unproject(px,py,z=0){if(window.FoundryRenderer)return window.FoundryRenderer.unproject(px,py,z);let u=(px-W/2)/scale,v=-(py-H/2)/scale,dz=z-cam.z;let denom=Math.cos(tilt)-v*scale*Math.sin(tilt)/1800;let yy=(v*(1-dz*Math.cos(tilt)*scale/1800)-dz*Math.sin(tilt))/denom;let k=1/(1+(yy*Math.sin(tilt)-dz*Math.cos(tilt))*scale/1800),xx=u/k;return{x:cam.x+xx*Math.cos(yaw)+yy*Math.sin(yaw),y:cam.y-xx*Math.sin(yaw)+yy*Math.cos(yaw),z}}
-function screenRadius(b,p){if(window.FoundryRenderer)return window.FoundryRenderer.radius(b);let vr;if(b.kind==='star')vr=9+Math.pow(Math.max(.01,b.mass),.22)*5;else if(b.kind==='bh')vr=Math.max(17,b.r*scale*p.k);else if(b.kind==='gas')vr=8+Math.pow(b.mass/.0009543,.2)*3;else if(b.kind==='debris'||b.kind==='asteroid')vr=1.5+Math.min(2,b.r*scale*p.k);else vr=5+Math.pow(b.mass/3e-6,.22)*1.5;return Math.max(b.r*scale*p.k,vr*Number($('sizeScale').value)*Math.pow(p.k,.3))}
-function pathWorld(points,color,width=1,dash=[]){if(points.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=width;ctx.setLineDash(dash);ctx.beginPath();points.forEach((v,i)=>{let p=project(v.x,v.y,v.z);if(i)ctx.lineTo(p.x,p.y);else ctx.moveTo(p.x,p.y)});ctx.stroke();ctx.setLineDash([])}
-function circleWorld(x,y,z,r,color,width=1){let pts=[];for(let i=0;i<=100;i++){let a=i/100*TAU;pts.push({x:x+Math.cos(a)*r,y:y+Math.sin(a)*r,z})}pathWorld(pts,color,width)}
-function updateFieldUI(){$('fieldBtn').classList.toggle('active',$('curvature').checked);$('fieldValue').textContent=$('fieldStrength').value+'×'}
-$('fieldBtn').onclick=()=>{$('curvature').checked=!$('curvature').checked;updateFieldUI()};$('curvature').onchange=updateFieldUI;$('fieldStrength').oninput=updateFieldUI;
-function prepareField(){let visible=bodies.filter(b=>{let p=project(b.x,b.y,b.z);return p.x>-200&&p.x<W+200&&p.y>-200&&p.y<H+200}).sort((a,b)=>b.mass-a.mass).slice(0,12);let max=visible[0]?.mass||1;fieldSources=visible.map(b=>({x:b.x,y:b.y,mass:b.mass,w:Math.max(b.r,(38+28*Math.sqrt(b.mass/max))/scale)}));let norm=fieldSources.reduce((v,b)=>Math.max(v,G*b.mass/b.w),1e-30);return norm}
-function fieldHeight(x,y,norm){let potential=0;for(let b of fieldSources)potential+=G*b.mass/Math.sqrt((x-b.x)**2+(y-b.y)**2+b.w*b.w);return -Number($('fieldStrength').value)*65/scale*Math.min(3,potential/norm)}
-function flammHeight(r,rs,outer,amplification){return amplification*2*Math.sqrt(rs*Math.max(0,r-rs))}
-function drawCurvature(){let amp=Number($('fieldStrength').value),bh=bodies.filter(b=>b.kind==='bh').sort((a,b)=>b.mass-a.mass)[0];if($('fieldMode').value==='schwarzschild'&&bh){let rs=bh.r,outer=Math.max(rs*12,240/scale),rings=28,spokes=48;let points=[];for(let i=rings;i>=0;i--){let u=i/rings,r=rs+(outer-rs)*u*u,z=bh.z+flammHeight(r,rs,outer,amp);let pts=[];for(let j=0;j<=96;j++){let a=j/96*TAU;pts.push({x:bh.x+r*Math.cos(a),y:bh.y+r*Math.sin(a),z})}pathWorld(pts,i===0?'#f4c58ad0':i<8?'#c3a8ec87':'#879fcb48',i===0?1.6:.7)}for(let j=0;j<spokes;j++){let a=j/spokes*TAU,pts=[];for(let i=0;i<=60;i++){let r=rs+(outer-rs)*(i/60)**2;pts.push({x:bh.x+r*Math.cos(a),y:bh.y+r*Math.sin(a),z:bh.z+flammHeight(r,rs,outer,amp)})}pathWorld(pts,'#a3b2d559',.7)}$('fieldCaption').innerHTML='<b>Срез Шварцшильда · одна ЧД</b><br>Поверхность Фламма · высота ×'+fmt(amp,1)+' · '+(settings.rel?'Ньютон + прецессия':'движение: Ньютон');return}
-let norm=prepareField();if(!fieldSources.length){if($('grid').checked)drawGrid();$('fieldCaption').textContent='Поле пусто — добавьте массивное тело.';return}let spacing=10**Math.floor(Math.log10(55/scale)),pix=spacing*scale;if(pix<24)spacing*=5;else if(pix<45)spacing*=2;let ext=Math.max(W,H)/scale*.85,n=Math.min(19,Math.ceil(ext/spacing)),cx=Math.round(cam.x/spacing)*spacing,cy=Math.round(cam.y/spacing)*spacing;for(let i=-n;i<=n;i++){let p1=[],p2=[];for(let j=0;j<=64;j++){let v=-ext+j/64*ext*2,x=cx+i*spacing,y=cy+v;p1.push({x,y,z:fieldHeight(x,y,norm)});x=cx+v;y=cy+i*spacing;p2.push({x,y,z:fieldHeight(x,y,norm)})}pathWorld(p1,i%5===0?'#8da8d368':'#617da340',.7);pathWorld(p2,i%5===0?'#8da8d368':'#617da340',.7)}for(let b of fieldSources.slice(0,5)){if(b.mass<(fieldSources[0]?.mass||1)*.001)continue;let z=fieldHeight(b.x,b.y,norm);pathWorld([{x:b.x,y:b.y,z:0},{x:b.x,y:b.y,z}],'#c6b0ed50',.7,[2,5]);circleWorld(b.x,b.y,z,b.w*.42,'#c4a3ef75',.8)}$('fieldCaption').innerHTML='<b>Гравитационные колодцы · карта потенциала</b><br>Глубина и сглаживание визуальные · силы не изменены';}
-function drawGrid(){let spacing=10**Math.floor(Math.log10(95/scale)),pix=spacing*scale;if(pix<48)spacing*=5;else if(pix<85)spacing*=2;let ext=Math.max(W,H)/scale*1.4;let cx=Math.round(cam.x/spacing)*spacing,cy=Math.round(cam.y/spacing)*spacing;let n=Math.min(24,Math.ceil(ext/spacing));for(let i=-n;i<=n;i++){let x=cx+i*spacing,y=cy+i*spacing;pathWorld([{x,y:cy-ext,z:0},{x,y:cy+ext,z:0}],Math.abs(x)<spacing*.01?'#3a506552':'#20344748');pathWorld([{x:cx-ext,y,z:0},{x:cx+ext,y,z:0}],Math.abs(y)<spacing*.01?'#3a506552':'#20344748')}let q=project(0,0,0);ctx.strokeStyle='#7096b280';ctx.beginPath();ctx.moveTo(q.x-4,q.y);ctx.lineTo(q.x+4,q.y);ctx.moveTo(q.x,q.y-4);ctx.lineTo(q.x,q.y+4);ctx.stroke()}
-function drawBackground(now){ctx.fillStyle='#070d17';ctx.fillRect(0,0,W,H);let g=ctx.createRadialGradient(W*.53,H*.43,0,W*.53,H*.43,W*.65);g.addColorStop(0,'#0c1b2e');g.addColorStop(.55,'#09101e');g.addColorStop(1,'#050911');ctx.fillStyle=g;ctx.fillRect(0,0,W,H);let holes=$('lensing').checked?bodies.filter(b=>b.kind==='bh').slice(0,4).map(b=>{let p=project(b.x,b.y,b.z);return {x:p.x,y:p.y,re:screenRadius(b,p)*2.5}}):[];for(let s of stars){let x=((s.x*W+yaw*35)%W+W)%W,y=((s.y*H+tilt*18)%H+H)%H,secondary=null;for(let h of holes){let dx=x-h.x,dy=y-h.y,beta=Math.hypot(dx,dy);if(beta>h.re*6||beta<.001)continue;let root=Math.sqrt(beta*beta+4*h.re*h.re),plus=(beta+root)/2,minus=(beta-root)/2;secondary={x:h.x+dx/beta*minus,y:h.y+dy/beta*minus,a:Math.min(.6,h.re*h.re/(beta*beta+1)*.18)};x=h.x+dx/beta*plus;y=h.y+dy/beta*plus}ctx.fillStyle=s.c>.8?'rgba(161,193,233,'+s.a+')':'rgba(216,225,240,'+s.a+')';ctx.beginPath();ctx.arc(x,y,s.s,0,TAU);ctx.fill();if(secondary){ctx.fillStyle='rgba(200,189,238,'+secondary.a+')';ctx.beginPath();ctx.arc(secondary.x,secondary.y,s.s*.85,0,TAU);ctx.fill()}}}
-
-function drawBH(b,p,r,now){let glow=ctx.createRadialGradient(p.x,p.y,r*.7,p.x,p.y,r*7);glow.addColorStop(0,'#ffd4a024');glow.addColorStop(.35,'#cc713b12');glow.addColorStop(1,'#e0924200');ctx.fillStyle=glow;ctx.beginPath();ctx.arc(p.x,p.y,r*7,0,TAU);ctx.fill();ctx.save();ctx.translate(p.x,p.y);ctx.rotate(-.12+yaw*.22);let flat=.25+.4*Math.cos(tilt);for(let i=9;i>=0;i--){ctx.strokeStyle=['#9d513b40','#b4603d50','#de865078','#f1ac6caa','#ffe0a0bb'][Math.min(4,Math.floor((9-i)/2))];ctx.lineWidth=Math.max(.8,r*.12);ctx.beginPath();ctx.ellipse(0,0,r*(2.2+i*.26),r*(2.2+i*.26)*flat,0,0,TAU);ctx.stroke()}ctx.fillStyle='#020307';ctx.beginPath();ctx.arc(0,0,r*1.13,0,TAU);ctx.fill();ctx.shadowColor='#ffc28c';ctx.shadowBlur=10;ctx.strokeStyle='#ffd29b';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(0,0,r*1.2,0,TAU);ctx.stroke();ctx.shadowBlur=0;ctx.strokeStyle='#ffe0acaa';ctx.lineWidth=r*.3;ctx.beginPath();ctx.ellipse(0,0,r*3.2,r*3.2*flat,0,0,Math.PI);ctx.stroke();ctx.restore()}
-function drawBody(b,p,r,now){if(b.kind==='bh'){drawBH(b,p,r,now);return}if(b.kind==='star'){let g=ctx.createRadialGradient(p.x,p.y,r*.4,p.x,p.y,r*8);g.addColorStop(0,b.color+'98');g.addColorStop(.16,b.color+'32');g.addColorStop(.5,b.color+'0c');g.addColorStop(1,b.color+'00');ctx.fillStyle=g;ctx.beginPath();ctx.arc(p.x,p.y,r*8,0,TAU);ctx.fill();ctx.shadowColor=b.color;ctx.shadowBlur=r*1.2;let surf=ctx.createRadialGradient(p.x-r*.25,p.y-r*.3,0,p.x,p.y,r);surf.addColorStop(0,'#fff6df');surf.addColorStop(.6,b.color);surf.addColorStop(1,b.color+'cc');ctx.fillStyle=surf;ctx.beginPath();ctx.arc(p.x,p.y,r,0,TAU);ctx.fill();ctx.shadowBlur=0;return}
-if(b.ring){ctx.strokeStyle=b.color+'65';ctx.lineWidth=Math.max(1,r*.4);ctx.beginPath();ctx.ellipse(p.x,p.y,r*2.05,r*.55,-.2,0,TAU);ctx.stroke()}
-let light=bodies.filter(x=>x.kind==='star').sort((a,c)=>luminosity(c)/((c.x-b.x)**2+(c.y-b.y)**2+.001)-luminosity(a)/((a.x-b.x)**2+(a.y-b.y)**2+.001))[0],lx=-.5,ly=-.55;if(light){let sp=project(light.x,light.y,light.z),dx=sp.x-p.x,dy=sp.y-p.y,d=Math.hypot(dx,dy)||1;lx=dx/d*.55;ly=dy/d*.55}let g=ctx.createRadialGradient(p.x+r*lx,p.y+r*ly,r*.05,p.x-r*lx*.4,p.y-r*ly*.4,r*1.3);g.addColorStop(0,b.color);g.addColorStop(.48,b.color);g.addColorStop(.88,'#1d2938');g.addColorStop(1,'#070c15');ctx.fillStyle=g;ctx.beginPath();ctx.arc(p.x,p.y,r,0,TAU);ctx.fill();ctx.save();ctx.beginPath();ctx.arc(p.x,p.y,r-.2,0,TAU);ctx.clip();
-if(b.kind==='gas'){ctx.globalAlpha=.23;for(let i=-3;i<=3;i++){ctx.strokeStyle=i%2?'#fff7d4':'#704b3b';ctx.lineWidth=r*.18;ctx.beginPath();ctx.ellipse(p.x,p.y+i*r*.25,r*1.1,r*.15,-.12,0,TAU);ctx.stroke()}}else if(b.kind==='rock'&&r>3&&b.color==='#79bde8'){ctx.fillStyle='#9ac49e';ctx.globalAlpha=.55;ctx.beginPath();ctx.ellipse(p.x-r*.22,p.y-r*.1,r*.29,r*.53,-.5,0,TAU);ctx.fill();ctx.beginPath();ctx.ellipse(p.x+r*.36,p.y+r*.25,r*.25,r*.31,.3,0,TAU);ctx.fill();ctx.strokeStyle='#e7f2fa';ctx.globalAlpha=.4;ctx.lineWidth=1;ctx.beginPath();ctx.ellipse(p.x,p.y-r*.3,r*.9,r*.18,.15,0,TAU);ctx.stroke()}ctx.restore();if(r>3){ctx.strokeStyle=b.color+'60';ctx.lineWidth=.7;ctx.beginPath();ctx.arc(p.x,p.y,r,0,TAU);ctx.stroke()}}
-function drawOrbitalEllipses(){for(let b of bodies){if(b.kind==='debris'||b.kind==='asteroid'||b.kind==='bh')continue;let el=elements(b);if(!el||el.e>.985||el.a<=0||el.c.mass<b.mass*.5)continue;let c=el.c,x=b.x-c.x,y=b.y-c.y,z=b.z-c.z,vx=b.vx-c.vx,vy=b.vy-c.vy,vz=b.vz-c.vz,r=Math.hypot(x,y,z),mu=G*(b.mass+c.mass),hx=y*vz-z*vy,hy=z*vx-x*vz,hz=x*vy-y*vx,h=Math.hypot(hx,hy,hz);if(h<1e-16)continue;let ex=(vy*hz-vz*hy)/mu-x/r,ey=(vz*hx-vx*hz)/mu-y/r,ez=(vx*hy-vy*hx)/mu-z/r,ev=Math.hypot(ex,ey,ez);if(ev<1e-6){ex=x/r;ey=y/r;ez=z/r}else{ex/=ev;ey/=ev;ez/=ev}let qx=(hy*ez-hz*ey)/h,qy=(hz*ex-hx*ez)/h,qz=(hx*ey-hy*ex)/h,pts=[];for(let i=0;i<=128;i++){let a=i/128*TAU,rr=h*h/mu/(1+el.e*Math.cos(a));pts.push({x:c.x+rr*(ex*Math.cos(a)+qx*Math.sin(a)),y:c.y+rr*(ey*Math.cos(a)+qy*Math.sin(a)),z:c.z+rr*(ez*Math.cos(a)+qz*Math.sin(a))})}pathWorld(pts,b.color+(b.id===selected?'42':'22'),.8)}}
-function draw(now,wallDt){$('fieldCaption').hidden=!$('curvature').checked;if(window.FoundryRenderer){window.FoundryRenderer.render(bodies,now,wallDt);ctx.clearRect(0,0,W,H)}else{drawBackground(now);if($('curvature').checked)drawCurvature();else if($('grid').checked)drawGrid()}if($('orbits').checked)drawOrbitalEllipses();if($('habitable').checked)for(let b of bodies)if(b.kind==='star'){let l=Math.sqrt(luminosity(b));for(let i=0;i<8;i++)circleWorld(b.x,b.y,b.z,(.95+i*.103)*l,'#85cdaa0b',Math.max(1,.1*l*scale));circleWorld(b.x,b.y,b.z,.95*l,'#93c4a642');circleWorld(b.x,b.y,b.z,1.67*l,'#93c4a642')}
-if($('trails').checked){for(let b of bodies){if(b.trail.length<2)continue;let pts=b.trail;ctx.lineWidth=b.id===selected?1.2:.75;for(let k=0;k<4;k++){let start=Math.floor(k*pts.length/4),end=Math.min(pts.length,Math.ceil((k+1)*pts.length/4)+1);pathWorld(pts.slice(start,end),b.color+['18','2b','4b','75'][k],b.id===selected?1.1:.7)}}}
-if($('prediction').checked&&pred.length>1)pathWorld(pred,'#c2d7eb70',1,[4,6]);
-let labelBoxes=[];let sb=getSelected();if(sb){let sp=project(sb.x,sb.y,sb.z),sr=screenRadius(sb,sp);ctx.font='500 11px -apple-system, Segoe UI, sans-serif';labelBoxes.push({id:sb.id,x:sp.x+sr+12,y:sp.y-8,w:ctx.measureText(sb.name).width+7,h:15})}let sorted=bodies.map(b=>{let p=project(b.x,b.y,b.z);return {b,p,r:screenRadius(b,p)}}).sort((a,b)=>b.p.depth-a.p.depth);hover=null;
-for(let {b,p,r}of sorted){if(p.x<-r*9||p.x>W+r*9||p.y<-r*9||p.y>H+r*9)continue;if(!window.FoundryRenderer)drawBody(b,p,r,now);if(Math.hypot(p.x-mouse.x,p.y-mouse.y)<Math.max(12,r+5))hover=b;if(b.id===selected){ctx.strokeStyle='#c3dff6b0';ctx.lineWidth=1;ctx.setLineDash([3,5]);ctx.beginPath();ctx.arc(p.x,p.y,r+8,0,TAU);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#b9d9f1';for(let s of [-1,1]){ctx.fillRect(p.x+s*(r+12)-1,p.y-1,2,2);ctx.fillRect(p.x-1,p.y+s*(r+12)-1,2,2)}}
-if($('labels').checked&&(b.kind!=='debris'&&b.kind!=='asteroid'||b.id===selected||b===hover)){ctx.font=(b.id===selected?'500 ':'')+'11px -apple-system, Segoe UI, sans-serif';ctx.fillStyle=b.id===selected?'#e0effd':'#adc2d6';ctx.textAlign='left';drawLabel(b,p,r,labelBoxes)}if($('vectors').checked){let end=project(b.x+b.vx*.1,b.y+b.vy*.1,b.z+b.vz*.1);arrow(p.x,p.y,end.x,end.y,b.color+'aa')}}
-for(let e of effects){e.age+=wallDt;let p=project(e.x,e.y,e.z),r=(8+e.age*65)*e.size;ctx.globalAlpha=Math.max(0,1-e.age/1.8);let g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,r);g.addColorStop(0,e.color+'88');g.addColorStop(1,e.color+'00');ctx.fillStyle=g;ctx.beginPath();ctx.arc(p.x,p.y,r,0,TAU);ctx.fill();ctx.strokeStyle=e.color;ctx.lineWidth=1;ctx.beginPath();ctx.arc(p.x,p.y,r*.7,0,TAU);ctx.stroke();ctx.globalAlpha=1}effects=effects.filter(e=>e.age<1.8);
-if(pointer&&tool==='launch'&&pointer.button===0){let p=project(pointer.world.x,pointer.world.y,pointer.world.z),v=launchVelocity(pointer.world,mouse),total=initialLaunchVelocity(v);let stamp=[mouse.x,mouse.y,$('launchGain').value,$('launchFrame').value,$('spawnMass').value,$('preset').value].join(':');if(stamp!==launchPathStamp||performance.now()-launchPathTime>500){previewLaunch();launchPathStamp=stamp;launchPathTime=performance.now()}if($('launchPreview').checked&&launchPath.length>1){pathWorld(launchPath,'#bca6fabb',1.3,[4,5]);let last=launchPath[launchPath.length-1];if(last.hit){let ep=project(last.x,last.y,last.z);ctx.strokeStyle='#f7b18f';ctx.beginPath();ctx.arc(ep.x,ep.y,6,0,TAU);ctx.stroke()}}arrow(p.x,p.y,mouse.x,mouse.y,'#b8e2ff');if($('launchFrame').value==='relative'&&getSelected()){let vl=Math.hypot(v.vx,v.vy,v.vz),factor=vl>0?Math.hypot(mouse.x-p.x,mouse.y-p.y)/(vl*scale):.2,ep=project(pointer.world.x+total.vx*factor,pointer.world.y+total.vy*factor,pointer.world.z+total.vz*factor);arrow(p.x,p.y,ep.x,ep.y,'#eec17f')}ctx.font='12px -apple-system, Segoe UI, sans-serif';ctx.fillStyle='#e2f0ff';ctx.fillText('v₀ '+fmt(Math.hypot(total.vx,total.vy,total.vz)*VUNIT,2)+' км/с · '+($('launchFrame').value==='world'?'мировая':'относительная'),mouse.x+13,mouse.y-12);ctx.fillStyle='#c6b7eb';ctx.fillText('Пунктир — гравитационный прогноз',mouse.x+13,mouse.y+7)}
-if((tool==='orbit'||tool==='launch')&&!pointer&&mouse.x>300&&mouse.x<W-320&&mouse.y>80&&mouse.y<H-100){let w=unproject(mouse.x,mouse.y,Number($('spawnZ').value)||0),p=project(w.x,w.y,w.z);ctx.strokeStyle='#a9d8ff88';ctx.setLineDash([3,4]);ctx.beginPath();ctx.arc(p.x,p.y,8,0,TAU);ctx.stroke();ctx.setLineDash([]);let c=tool==='orbit'?(bodies.find(b=>b.id===orbitAnchor)||getSelected()):getSelected();if(tool==='orbit'&&c){let r=Math.hypot(w.x-c.x,w.y-c.y,w.z-c.z);circleWorld(c.x,c.y,c.z,r,'#b9d4ec30',1)}}
-cv.style.cursor=pointer?(pointer.button===2?'grabbing':tool==='launch'?'crosshair':'grabbing'):tool==='delete'?'not-allowed':tool!=='select'?'crosshair':hover?'pointer':'grab';drawCompass();}
-function drawLabel(b,p,r,boxes){let w=ctx.measureText(b.name).width+7,h=15,own=boxes.find(q=>q.id===b.id);let candidates=own?[{x:own.x,y:own.y}]:[{x:p.x+r+12,y:p.y-8},{x:p.x+r+10,y:p.y-25},{x:p.x-w-r-9,y:p.y-8},{x:p.x+r+10,y:p.y+10}];for(let pos of candidates){if(b.id!==selected&&boxes.some(q=>q.id!==b.id&&pos.x<q.x+q.w&&pos.x+w>q.x&&pos.y<q.y+q.h&&pos.y+h>q.y))continue;ctx.fillText(b.name,pos.x,pos.y+12);if(!own)boxes.push({id:b.id,x:pos.x,y:pos.y,w,h});return}}
-function drawCompass(){let x=W-342,y=H-153;ctx.font='10px -apple-system, Segoe UI, sans-serif';let origin=project(cam.x,cam.y,cam.z);for(let a of [{v:[1,0,0],c:'#da9b96',s:'X'},{v:[0,1,0],c:'#a2c4a0',s:'Y'},{v:[0,0,1],c:'#8fb9e4',s:'Z'}]){let p=project(cam.x+a.v[0]/scale*27,cam.y+a.v[1]/scale*27,cam.z+a.v[2]/scale*27),dx=p.x-origin.x,dy=p.y-origin.y;ctx.strokeStyle=a.c;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+dx,y+dy);ctx.stroke();ctx.fillStyle=a.c;ctx.fillText(a.s,x+dx+3,y+dy+3)}}
-function arrow(x,y,ex,ey,color){let a=Math.atan2(ey-y,ex-x),d=Math.hypot(ex-x,ey-y);if(d<1)return;if(d>150&&!(pointer&&tool==='launch')){ex=x+Math.cos(a)*150;ey=y+Math.sin(a)*150}ctx.strokeStyle=color;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(ex,ey);ctx.lineTo(ex-Math.cos(a-.4)*8,ey-Math.sin(a-.4)*8);ctx.moveTo(ex,ey);ctx.lineTo(ex-Math.cos(a+.4)*8,ey-Math.sin(a+.4)*8);ctx.stroke()}
-function predict(){let b=getSelected();pred=[];if(!b||!$('prediction').checked||bodies.length>100)return;let el=elements(b),horizon=el&&Number.isFinite(el.period)?Math.min(el.period*1.12,10000):Math.max(rate*20,.05);let copies=bodies.map(b=>({...b,trail:null})),idx=bodies.indexOf(b),dt=horizon/220,minDist=Infinity;for(let a of copies)if(a.id!==b.id)minDist=Math.min(minDist,Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z));if(!Number.isFinite(dt)||dt<=0)return;let start=performance.now(),elapsed=0;pred.push({x:b.x,y:b.y,z:b.z});for(let i=0;i<240;i++){let target=elapsed+dt;for(let k=0;k<12&&elapsed<target;k++){let q=copies[idx],safe=dt;for(let a of copies){if(a===q)continue;let r2=(q.x-a.x)**2+(q.y-a.y)**2+(q.z-a.z)**2+settings.soft**2;safe=Math.min(safe,.06*Math.sqrt(r2**1.5/(G*(q.mass+a.mass))))}let step=Math.min(target-elapsed,safe);leap(step,copies);elapsed+=step;if(performance.now()-start>13)break}let q=copies[idx];pred.push({x:q.x,y:q.y,z:q.z});if(performance.now()-start>13)break}}
-function uiUpdate(){let b=getSelected();$('nBodies').textContent=bodies.length+' '+(bodies.length===1?'тело':'тел');$('simTime').textContent=t<1/365.25?fmt(t*YR,0)+' с':t<1?fmt(t*365.25,2)+' дней':fmt(t,2)+' лет';$('energyLabel').textContent=(settings.rel?'ΔEₙ ':'ΔE ')+fmt(stats.drift*100,3)+'%';$('energyLabel').style.color=Math.abs(stats.drift)>.01?'var(--gold)':'var(--text)';$('totalMass').textContent=fmt(stats.mass,5)+' M☉';$('totalMomentum').textContent=fmt(stats.p,6);$('energyDrift').textContent=fmt(stats.drift*100,4)+'%';$('stepCount').textContent=steps;$('bodyCount').textContent=bodies.length+' / '+MAX;$('cameraLabel').textContent=follow?(getSelected()?.id===follow?'За объектом':'Слежение'):'Свободная';$('fps').textContent=Math.round(lastFPS)+' FPS';$('simStatus').textContent=paused?'пауза':limited?'CPU: время замедлено':'адаптивный шаг';$('simStatus').style.color=limited?'var(--gold)':'var(--muted)';$('viewLabel').textContent=tilt<.01?'Ортогональная плоскость XY':'Перспектива · XY + Z';let s=10**Math.floor(Math.log10(100/scale));if(s*scale<40)s*=5;else if(s*scale<75)s*=2;$('scaleText').textContent=s<.001?fmt(s*AU,0)+' км':fmt(s,3)+' а.е.';$('scaleLine').style.width=s*scale+'px';if(b){$('bodyName').textContent=b.name;$('metricVel').textContent=fmt(Math.hypot(b.vx,b.vy,b.vz)*VUNIT,2)+' км/с';$('metricDist').textContent=fmt(Math.hypot(b.x-stats.com.x,b.y-stats.com.y,b.z-stats.com.z),4)+' а.е.';$('metricAcc').textContent=fmt(Math.hypot(b.ax,b.ay,b.az)*AU*1000/YR**2,4)+' м/с²';let temp=temperature(b);$('metricTemp').textContent=b.kind==='bh'?'—':fmt(temp,0)+' K';let hole=bodies.filter(a=>a.kind==='bh'&&a!==b).sort((a,c)=>c.mass/Math.hypot(c.x-b.x,c.y-b.y,c.z-b.z)-a.mass/Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z))[0];let distance=hole?Math.hypot(b.x-hole.x,b.y-hole.y,b.z-hole.z):0;let clock=hole&&distance>hole.r?Math.sqrt(1-hole.r/distance):null;$('metricClock').textContent=clock!==null?fmt(clock,6)+'×':hole?'за горизонтом':'нет ЧД';let center=dominant(b);$('metricEscape').textContent=center?fmt(Math.sqrt(2*G*(b.mass+center.mass)/Math.max(center.r,Math.hypot(b.x-center.x,b.y-center.y,b.z-center.z)))*VUNIT,2)+' км/с':'—';let el=elements(b);$('metricOrbit').textContent=el?fmt(el.a,3)+' / '+fmt(el.e,3):'—';$('metricPeriod').textContent=el?Number.isFinite(el.period)?(el.period<1/365?fmt(el.period*YR,1)+' с':el.period<1?fmt(el.period*365.25,2)+' дн':fmt(el.period,2)+' лет'):'незамкнутая':'—';$('followBtn').classList.toggle('active',follow===b.id);updateLaunchNote()}else for(let id of ['metricVel','metricDist','metricAcc','metricTemp','metricClock','metricEscape','metricOrbit','metricPeriod'])$(id).textContent='—';if(dirtyList){$('bodyList').replaceChildren(...bodies.map(b=>{let bt=document.createElement('button');bt.className='body-item'+(b.id===selected?' active':'');let sw=document.createElement('span');sw.className='swatch';sw.style.background=b.color;let name=document.createElement('span');name.textContent=b.name;let m=document.createElement('small');m.textContent=fmt(b.mass,3);bt.append(sw,name,m);bt.onclick=()=>{select(b);if(tool==='orbit'){orbitAnchor=b.id;updateOrbitNote()}if(follow)follow=b.id};return bt}));dirtyList=false}}
-function cancelPointer(){if(pointer&&pointer.wasPaused!==undefined){paused=pointer.wasPaused;updatePause()}pointer=null;launchPath=[];launchPathStamp=''}
-function updateOrbitNote(){if(tool!=='orbit')return;let c=bodies.find(b=>b.id===orbitAnchor)||getSelected();$('toolDescription').textContent=c?'Центр: «'+c.name+'» закреплён. Щёлкните по другому телу, чтобы сменить центр.':'Нет центра: сначала создайте звезду.'}
-function updateLaunchNote(){let b=getSelected(),relative=$('launchFrame').value==='relative';$('launchFrameNote').textContent=relative?(b?'К скорости стрелки добавится скорость «'+b.name+'». Золотая стрелка — итоговая.':'Нет опорного тела: запуск в мировой системе.'):'Мировая система: скорость других тел не наследуется. Прицеливание ставит время на паузу.'}
-function setTool(tl){cancelPointer();tool=tl;if(tl!=='select'&&window.showLeft)window.showLeft('create');if(tl==='orbit')orbitAnchor=selected;$('launchControls').hidden=tl!=='launch';updateLaunchNote();document.querySelectorAll('[data-tool]').forEach(b=>b.classList.toggle('active',b.dataset.tool===tl));let text={select:'Выберите тело. ЛКМ по пустоте — перемещение камеры.',orbit:'Выберите центр притяжения, затем щёлкните: тело получит круговую скорость.',launch:'Стрелка — начальная скорость, пунктир — путь под действием гравитации. Прицеливание приостанавливает время.',delete:'Щёлкните по телу, чтобы удалить его. Масса и энергия изменятся.'};$('toolDescription').textContent=text[tl];updateOrbitNote();$('hint').textContent=tl==='select'?'ЛКМ — выбор / панорама · ПКМ — поворот · Колесо — масштаб · Space — пауза':text[tl]}
-document.querySelectorAll('[data-tool]').forEach(b=>b.onclick=()=>setTool(b.dataset.tool));
-function pick(x,y){let best=null,dist=Infinity;for(let b of bodies){let p=project(b.x,b.y,b.z),r=screenRadius(b,p),d=Math.hypot(x-p.x,y-p.y);if(d<Math.max(12,r+6)&&d<dist){best=b;dist=d}}return best}
-function launchVelocity(world,end){let w=unproject(end.x,end.y,world.z),p=project(world.x,world.y,world.z),dx=w.x-world.x,dy=w.y-world.y,d=Math.hypot(dx,dy),gain=Number($('launchGain').value),pixels=Math.hypot(end.x-p.x,end.y-p.y);if(!Number.isFinite(gain)||gain<.001||gain>100000||d<1e-15||pixels<1)return {vx:0,vy:0,vz:0};let speed=pixels/100*gain/VUNIT;return {vx:dx/d*speed,vy:dy/d*speed,vz:0}}
-function initialLaunchVelocity(v){let ref=$('launchFrame').value==='relative'?getSelected():null;return {vx:v.vx+(ref?.vx||0),vy:v.vy+(ref?.vy||0),vz:v.vz+(ref?.vz||0)}}
-function candidate(world,velocity){let p=presets[$('preset').value],m=Number($('spawnMass').value);if(!Number.isFinite(m)||m<1e-14||m>1e9)return null;let r=p.kind==='bh'?2*G*m/C**2:p.r*Math.cbrt(m/p.mass);return {id:-1,name:'Предпросмотр',kind:p.kind,mass:m,r,x:world.x,y:world.y,z:world.z,...velocity,ax:0,ay:0,az:0}}
-function previewLaunch(){launchPath=[];if(!pointer||tool!=='launch'||!$('launchPreview').checked||bodies.length>100)return;let q=candidate(pointer.world,initialLaunchVelocity(launchVelocity(pointer.world,mouse)));if(!q)return;let arr=bodies.map(b=>({...b,trail:null}));arr.push(q);let horizon=Infinity;for(let b of bodies){let r=Math.hypot(q.x-b.x,q.y-b.y,q.z-b.z),v=Math.hypot(q.vx-b.vx,q.vy-b.vy,q.vz-b.vz);horizon=Math.min(horizon,4*Math.sqrt(r**3/(G*(q.mass+b.mass))),6*r/(v+1e-20))}if(!Number.isFinite(horizon))horizon=Math.max(rate*8,2/Math.max(Math.hypot(q.vx,q.vy,q.vz),.01));horizon=Math.max(1e-12,Math.min(horizon,1000));let elapsed=0,next=0,started=performance.now();launchPath.push({x:q.x,y:q.y,z:q.z,elapsed});for(let k=0;k<1600&&elapsed<horizon;k++){let dt=Math.min(horizon/240,safeStep(arr),horizon-elapsed);if(!(dt>0))break;leap(dt,arr);elapsed+=dt;if(elapsed>=next){launchPath.push({x:q.x,y:q.y,z:q.z,elapsed});next=elapsed+horizon/300}if(arr.some(b=>b!==q&&Math.hypot(q.x-b.x,q.y-b.y,q.z-b.z)<(b.kind==='bh'?b.r:b.r+q.r))){launchPath.push({x:q.x,y:q.y,z:q.z,hit:true});break}if(k%8===0&&performance.now()-started>12)break}}
-$('launchFrame').onchange=()=>{updateLaunchNote();launchPathStamp=''};$('launchGain').oninput=()=>launchPathStamp='';
-function spawn(world,vel=null,orb=false){if(bodies.length>=MAX){notify('Лимит: '+MAX+' тел. Удалите несколько объектов.');return}let p=presets[$('preset').value],mass=Number($('spawnMass').value),z=Number($('spawnZ').value);if(!Number.isFinite(mass)||mass<1e-14||mass>1e9||!Number.isFinite(z)||Math.abs(z)>1e8){notify('Проверьте массу (10⁻¹⁴…10⁹ M☉) и высоту.');return}let c=orb?(bodies.find(b=>b.id===orbitAnchor)||getSelected()):getSelected(),oldCV=c?{vx:c.vx,vy:c.vy,vz:c.vz}:null,b=body({...p,name:p.name+' '+nextId,mass,r:p.r*Math.cbrt(mass/p.mass),x:world.x,y:world.y,z});if(bodies.some(a=>a!==b&&Math.hypot(b.x-a.x,b.y-a.y,b.z-a.z)<a.r+b.r)){removeBody(b,true);notify('Точка внутри физического тела. Выберите место дальше.');return}if(c){if(Math.hypot(b.x-c.x,b.y-c.y,b.z-c.z)<c.r+b.r){removeBody(b,true);notify('Точка внутри физического тела. Выберите место дальше.');return}if(orb){let v=orbitVel(b,c);if(v){let m=c.mass+b.mass,cx=c.vx,cy=c.vy,cz=c.vz;c.vx=cx-v.vx*b.mass/m;c.vy=cy-v.vy*b.mass/m;c.vz=cz-v.vz*b.mass/m;b.vx=cx+v.vx*c.mass/m;b.vy=cy+v.vy*c.mass/m;b.vz=cz+v.vz*c.mass/m}}else{let v=initialLaunchVelocity(vel||{vx:0,vy:0,vz:0});b.vx=v.vx;b.vy=v.vy;b.vz=v.vz}}else if(vel){b.vx=vel.vx;b.vy=vel.vy;b.vz=vel.vz}if(![b.vx,b.vy,b.vz].every(Number.isFinite)||Math.hypot(b.vx,b.vy,b.vz)>=C*.99){if(c&&oldCV){c.vx=oldCV.vx;c.vy=oldCV.vy;c.vz=oldCV.vz}removeBody(b,true);notify('Скорость должна быть меньше 0,99 c. Уменьшите длину стрелки или её масштаб.');return}if(orb&&!c)orbitAnchor=b.id;select(b);updateOrbitNote();event('Создано: '+b.name);notify(orb&&c?'Тело выведено на начальную круговую орбиту.':'Создано: '+b.name);accel(bodies)}
-cv.oncontextmenu=e=>e.preventDefault();cv.addEventListener('pointerdown',e=>{if(pointer)return;if(e.button!==0&&e.button!==2&&e.button!==1)return;mouse={x:e.clientX,y:e.clientY};pointer={button:e.button,x:e.clientX,y:e.clientY,lastX:e.clientX,lastY:e.clientY,moved:false,hit:pick(e.clientX,e.clientY),world:unproject(e.clientX,e.clientY,Number($('spawnZ').value)||0)};if(tool==='launch'&&e.button===0){pointer.wasPaused=paused;paused=true;follow=null;updatePause()}cv.setPointerCapture(e.pointerId)});
-cv.addEventListener('pointermove',e=>{mouse={x:e.clientX,y:e.clientY};if(!pointer)return;let dx=e.clientX-pointer.lastX,dy=e.clientY-pointer.lastY;if(Math.hypot(e.clientX-pointer.x,e.clientY-pointer.y)>4)pointer.moved=true;if(pointer.button===2){yaw+=dx*.006;tilt=Math.max(0,Math.min(1.18,tilt+dy*.005));$('view3d').classList.toggle('active',tilt>.01);$('viewTop').classList.toggle('active',tilt<=.01)}else if(pointer.button===1||(tool==='select'&&pointer.moved)){let a=unproject(pointer.lastX,pointer.lastY,cam.z),b=unproject(e.clientX,e.clientY,cam.z);cam.x+=a.x-b.x;cam.y+=a.y-b.y;follow=null}pointer.lastX=e.clientX;pointer.lastY=e.clientY});
-cv.addEventListener('pointerup',e=>{if(!pointer)return;let p=pointer;pointer=null;if(p.button!==0)return;let b=pick(e.clientX,e.clientY);if(tool==='select'&&!p.moved){select(b);if(follow)follow=b?.id||null}else if(tool==='delete'&&!p.moved&&b){removeBody(b);syncFields()}else if(tool==='orbit'&&!p.moved){if(p.hit){orbitAnchor=p.hit.id;select(p.hit);updateOrbitNote();notify('Центр орбиты: '+p.hit.name)}else spawn(p.world,null,true)}else if(tool==='launch'){let gain=Number($('launchGain').value);if(Number.isFinite(gain)&&gain>=.001&&gain<=100000)spawn(p.world,launchVelocity(p.world,mouse),false);else notify('Масштаб скорости должен быть от 0,001 до 100 000 км/с на 100 px.');paused=p.wasPaused??paused;updatePause();launchPath=[];launchPathStamp=''}});cv.addEventListener('pointercancel',cancelPointer);cv.addEventListener('lostpointercapture',()=>{if(pointer)cancelPointer()});
-cv.addEventListener('wheel',e=>{e.preventDefault();let z=cam.z,a=unproject(e.clientX,e.clientY,z);scale=Math.min(1e10,Math.max(.00001,scale*Math.exp(-e.deltaY*.0012)));targetScale=scale;let b=unproject(e.clientX,e.clientY,z);if(!follow){cam.x+=a.x-b.x;cam.y+=a.y-b.y}},{passive:false});
-function fit(){follow=null;if(!bodies.length){cam=vec();scale=targetScale=130;return}let xs=bodies.map(b=>b.x),ys=bodies.map(b=>b.y),zs=bodies.map(b=>b.z);cam={x:(Math.min(...xs)+Math.max(...xs))/2,y:(Math.min(...ys)+Math.max(...ys))/2,z:(Math.min(...zs)+Math.max(...zs))/2};scale=1;let pts=bodies.map(b=>project(b.x,b.y,b.z)),rx=Math.max(...pts.map(p=>Math.abs(p.x-W/2))),ry=Math.max(...pts.map(p=>Math.abs(p.y-H/2)));scale=targetScale=Math.min((W-680)/Math.max(rx*2,1e-10),(H-270)/Math.max(ry*2,1e-10));scale=Math.max(.00001,Math.min(1e10,scale));targetScale=scale;notify('Вся система в кадре')}
-function toggleFollow(){let b=getSelected();if(!b)return;follow=follow===b.id?null:b.id;if(follow)cam={x:b.x,y:b.y,z:b.z};syncFields()}
-$('followBtn').onclick=toggleFollow;$('focusBtn').onclick=()=>{let b=getSelected();if(b){cam={x:b.x,y:b.y,z:b.z};notify('Камера: '+b.name)}};$('fitBtn').onclick=fit;$('view3d').onclick=()=>{tilt=.58;yaw=-.28;$('view3d').classList.add('active');$('viewTop').classList.remove('active')};$('viewTop').onclick=()=>{tilt=0;yaw=0;$('viewTop').classList.add('active');$('view3d').classList.remove('active')};$('clearTrails').onclick=()=>{bodies.forEach(b=>b.trail=[]);notify('Следы очищены')};$('sizeScale').oninput=()=>$('sizeValue').textContent=$('sizeScale').value+'×';
-$('preset').onchange=()=>$('spawnMass').value=presets[$('preset').value].mass.toExponential(3);
-$('applyBtn').onclick=()=>{let b=getSelected();if(!b)return;let m=Number($('editMass').value),r=Number($('editRadius').value)/AU,vx=Number($('editVx').value)/VUNIT,vy=Number($('editVy').value)/VUNIT,vz=Number($('editVz').value)/VUNIT;if(![m,r,vx,vy,vz].every(Number.isFinite)||m<1e-14||m>1e9||r<=0||r>1e11/AU||Math.hypot(vx,vy,vz)>C*.99){notify('Недопустимые значения: проверьте массу, радиус и скорость (< 0,99 c).');return}b.mass=m;b.r=b.kind==='bh'?2*G*m/(C*C):r;b.vx=vx;b.vy=vy;b.vz=vz;b.name=$('editName').value.trim()||'Без имени';b.color=$('editColor').value;b.trail=[];baselineDirty=true;dirtyList=true;pred=[];accel(bodies);syncFields();event('Изменены параметры: '+b.name);notify('Параметры применены')};
-$('removeBtn').onclick=()=>{let b=getSelected();if(b){removeBody(b);syncFields()}};$('circularBtn').onclick=()=>{let b=getSelected(),c=b&&dominant(b);if(!c){notify('Нужно второе тело — центр притяжения.');return}setCircular(b,c);b.trail=[];pred=[];event('Круговая скорость: '+b.name);notify('Орбита относительно '+c.name+' скорректирована')};
-function burn(sign){let b=getSelected();if(!b)return;let c=dominant(b),vx=b.vx-(c?.vx||0),vy=b.vy-(c?.vy||0),vz=b.vz-(c?.vz||0),v=Math.hypot(vx,vy,vz),dv=Number($('burn').value)/VUNIT*sign;if(!Number.isFinite(dv)||Math.abs(dv)>C*.9){notify('Проверьте величину импульса.');return}if(v<1e-15){notify('Нет направления скорости. Задайте Vx или Vy.');return}b.vx+=dv*vx/v;b.vy+=dv*vy/v;b.vz+=dv*vz/v;baselineDirty=true;pred=[];syncFields();event('Манёвр '+b.name+': '+fmt(dv*VUNIT,2)+' км/с');notify('Импульс приложен')}$('prograde').onclick=()=>burn(1);$('retrograde').onclick=()=>burn(-1);
-$('beltBtn').onclick=()=>{let c=getSelected();if(!c){notify('Сначала выберите центральное тело.');return}if(bodies.length+24>MAX){notify('Для пояса нужно 24 свободных места.');return}let host=dominant(c),hill=host&&host.mass>c.mass*10?Math.hypot(c.x-host.x,c.y-host.y,c.z-host.z)*Math.cbrt(c.mass/(3*host.mass)):Infinity;let base=Math.max(c.r*4,Math.min(.8*150/scale,hill*.24));for(let i=0;i<24;i++){let a=rand()*TAU,d=base*(1+rand()*.65);orbitBody(c,{...presets.asteroid,name:'Астероид '+nextId},d,a,{inc:(rand()-.5)*.09})}baselineDirty=true;event('Добавлен пояс: 24 тела');notify('Добавлен пояс из 24 астероидов')};
-$('cometBtn').onclick=()=>{let c=getSelected();if(!c){notify('Выберите центр притяжения.');return}if(bodies.length>=MAX){notify('Достигнут лимит тел.');return}let host=dominant(c),hill=host&&host.mass>c.mass*10?Math.hypot(c.x-host.x,c.y-host.y,c.z-host.z)*Math.cbrt(c.mass/(3*host.mass)):Infinity;let d=Math.max(c.r*12,Math.min(300/scale,hill*.65)),a=rand()*TAU;let b=orbitBody(c,{...presets.asteroid,name:'Комета '+nextId,color:'#c1e4e9',mass:1e-13,r:12/AU},d,a,{inc:.4});b.vx=c.vx+(b.vx-c.vx)*.4;b.vy=c.vy+(b.vy-c.vy)*.4;b.vz=c.vz+(b.vz-c.vz)*.4;select(b);event('Добавлена комета на вытянутой орбите');notify('Комета направляется к перицентру')};
-document.querySelectorAll('[data-tab]').forEach(bt=>bt.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b===bt));document.querySelectorAll('.tab-pane').forEach(p=>p.hidden=p.id!=='tab-'+bt.dataset.tab)});
-$('collision').onchange=()=>{settings.collision=$('collision').value;baselineDirty=true};$('accuracy').onchange=()=>settings.accuracy=Number($('accuracy').value);$('softening').onchange=()=>{let v=Number($('softening').value);if(!Number.isFinite(v)||v<1e-10||v>1){$('softening').value=settings.soft;notify('ε должно быть от 10⁻¹⁰ до 1 а.е.');return}settings.soft=v;baselineDirty=true;pred=[]};$('tides').onchange=()=>settings.tides=$('tides').checked;$('grRel').onchange=()=>{settings.rel=$('grRel').checked;baselineDirty=true};$('zeroMomentum').onclick=()=>{centerMomentum();syncFields();event('Переход в систему центра масс');notify('Центр масс покоится в начале координат')};
-function updatePause(){$('pauseBtn').textContent=paused?'▶':'Ⅱ';$('pauseBtn').setAttribute('aria-label',paused?'Продолжить':'Приостановить');$('liveText').textContent=paused?'ПАУЗА':'СИМУЛЯЦИЯ';$('liveDot').style.background=paused?'var(--gold)':'var(--green)'}function togglePause(){paused=!paused;updatePause()}$('pauseBtn').onclick=togglePause;$('stepBtn').onclick=()=>{paused=true;simulate(Math.max(1e-12,Math.min(rate/60,safeStep())));updatePause();sampleTrails();updateStats();uiUpdate()};$('resetBtn').onclick=()=>loadScene(scenario);$('clearBtn').onclick=()=>loadScene('empty');
-function payload(){return {format:'orbit-foundry',version:1,scenario,t,nextId,selected,follow,paused,rate,settings:{...settings},ui:{launchFrame:$('launchFrame').value,launchGain:Number($('launchGain').value),curvature:$('curvature').checked,fieldMode:$('fieldMode').value,fieldStrength:Number($('fieldStrength').value),lensing:$('lensing').checked},camera:{...cam,scale,yaw,tilt},bodies:bodies.map(b=>({id:b.id,name:b.name,kind:b.kind,mass:b.mass,r:b.r,x:b.x,y:b.y,z:b.z,vx:b.vx,vy:b.vy,vz:b.vz,color:b.color,ring:!!b.ring,tidalDone:!!b.tidalDone}))}}
-function blobDownload(blob,name){let a=document.createElement('a'),u=URL.createObjectURL(blob);a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),5000)}
-$('exportBtn').onclick=()=>{blobDownload(new Blob([JSON.stringify(payload(),null,2)],{type:'application/json'}),'orbit-foundry-'+new Date().toISOString().slice(0,10)+'.json');notify('JSON экспортирован')};
-$('saveBtn').onclick=()=>{try{localStorage.setItem('orbit-foundry-v1',JSON.stringify(payload()));notify('Система сохранена в этом браузере')}catch(e){notify('Браузер не разрешил сохранение. Используйте экспорт JSON.')}};
-function restore(data){if(!data||data.format!=='orbit-foundry'||data.version!==1||!Array.isArray(data.bodies)||data.bodies.length>MAX)throw Error('Неверный формат или превышен лимит тел.');let ids=new Set(),loaded=[];for(let o of data.bodies){if(!Number.isInteger(o.id)||o.id<1||ids.has(o.id))throw Error('Неверные ID тел.');ids.add(o.id);for(let key of ['x','y','z','vx','vy','vz','mass','r'])if(typeof o[key]!=='number'||!Number.isFinite(o[key])||Math.abs(o[key])>1e12)throw Error('Некорректные числовые данные.');if(o.mass<1e-14||o.mass>1e9||o.r<=0||!Object.keys(kinds).includes(o.kind))throw Error('Недопустимые параметры тела.');loaded.push({id:o.id,name:String(o.name||'Тело').slice(0,36),kind:o.kind,mass:o.mass,r:o.kind==='bh'?2*G*o.mass/C**2:o.r,x:o.x,y:o.y,z:o.z,vx:o.vx,vy:o.vy,vz:o.vz,color:/^#[0-9a-f]{6}$/i.test(o.color)?o.color:'#a9c9e9',ring:!!o.ring,tidalDone:!!o.tidalDone,trail:[],ax:0,ay:0,az:0})}let s=data.settings||{},c=data.camera||{};if(!Number.isFinite(data.t)||data.t<0||data.t>1e12||!Number.isFinite(data.rate)||data.rate<1e-6||data.rate>100)throw Error('Некорректное время.');for(let key of ['x','y','z','scale','yaw','tilt'])if(typeof c[key]!=='number'||!Number.isFinite(c[key])||Math.abs(c[key])>1e12)throw Error('Некорректная камера.');if(c.scale<.00001||c.scale>1e10||c.tilt<0||c.tilt>1.18)throw Error('Недопустимый масштаб камеры.');if(!['merge','bounce','fragment','none'].includes(s.collision)||![.015,.035,.07].includes(s.accuracy)||!Number.isFinite(s.soft)||s.soft<1e-10||s.soft>1)throw Error('Некорректные настройки физики.');
-let u=data.ui||{};$('launchFrame').value=u.launchFrame==='relative'?'relative':'world';$('launchGain').value=Number.isFinite(u.launchGain)&&u.launchGain>=.001&&u.launchGain<=100000?u.launchGain:10;$('curvature').checked=u.curvature!==false;$('fieldMode').value=u.fieldMode==='schwarzschild'?'schwarzschild':'potential';$('fieldStrength').value=Number.isFinite(u.fieldStrength)&&u.fieldStrength>=.5&&u.fieldStrength<=4?u.fieldStrength:2;$('lensing').checked=u.lensing!==false;updateFieldUI();orbitAnchor=null;bodies=loaded;nextId=Math.max(0,...loaded.map(b=>b.id))+1;t=data.t;settings={collision:s.collision,accuracy:s.accuracy,soft:s.soft,tides:!!s.tides,rel:!!s.rel};selected=ids.has(data.selected)?data.selected:null;follow=ids.has(data.follow)?data.follow:null;paused=true;cam={x:c.x,y:c.y,z:c.z};scale=targetScale=c.scale;yaw=c.yaw;tilt=c.tilt;scenario=scenes[data.scenario]?data.scenario:'empty';$('scenarioTitle').textContent='Своя вселенная';$('scenarioDesc').textContent='Система восстановлена из сохранения. Время приостановлено.';document.querySelectorAll('[data-scene]').forEach(b=>b.classList.remove('active'));$('timeRate').value=Math.log10(data.rate);setRate();$('collision').value=settings.collision;$('accuracy').value=settings.accuracy;$('softening').value=settings.soft;$('tides').checked=settings.tides;$('grRel').checked=settings.rel;events=[];effects=[];pred=[];pointer=null;dirtyList=true;baselineDirty=true;energy0=null;accel(bodies);syncFields();updatePause();updateStats();uiUpdate();event('Восстановлена система: '+bodies.length+' тел');notify('Система загружена. Нажмите Space для запуска.')}
-$('restoreBtn').onclick=()=>{try{let raw=localStorage.getItem('orbit-foundry-v1');if(!raw){notify('В этом браузере ещё нет сохранения.');return}if(confirm('Заменить текущую систему сохранением?'))restore(JSON.parse(raw))}catch(e){notify('Не удалось загрузить: '+e.message)}};
-$('importBtn').onclick=()=>$('fileInput').click();$('fileInput').onchange=async e=>{let f=e.target.files[0];e.target.value='';if(!f)return;if(f.size>2e6){notify('Файл слишком большой: максимум 2 МБ.');return}try{let data=JSON.parse(await f.text());if(confirm('Заменить текущую систему данными из файла?'))restore(data)}catch(err){notify('Ошибка импорта: '+err.message)}};
-let helpPrevPaused=false,prevFocus=null;function showHelp(){helpPrevPaused=paused;paused=true;updatePause();prevFocus=document.activeElement;$('help').hidden=false;$('closeHelp').focus()}function closeHelp(){if($('help').hidden)return;$('help').hidden=true;paused=helpPrevPaused;updatePause();prevFocus?.focus()}$('helpBtn').onclick=showHelp;$('closeHelp').onclick=closeHelp;$('help').onclick=e=>{if(e.target===$('help'))closeHelp()};function cinema(){document.body.classList.toggle('hidden-ui');if(document.body.classList.contains('hidden-ui'))notify('Кинорежим · Tab — вернуть интерфейс · P — снимок')}$('cinemaBtn').onclick=cinema;
-function screenshot(){cv.toBlob(b=>{if(b)blobDownload(b,'orbit-foundry.png')});notify('Снимок пространства сохранён в PNG')}
-addEventListener('keydown',e=>{let editing=['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName);if(!$('help').hidden){if(e.key==='Escape')closeHelp();if(e.key==='Tab'){let nodes=[...$('help').querySelectorAll('button')];if(!nodes.length)return;e.preventDefault();nodes[0].focus()}return}if(editing)return;if(e.code==='Space'){e.preventDefault();togglePause()}else if(e.key==='Tab'){e.preventDefault();cinema()}else if(e.key==='Escape'){setTool('select');document.body.classList.remove('hidden-ui')}else if(e.key==='Delete'||e.key==='Backspace'){e.preventDefault();let b=getSelected();if(b){removeBody(b);syncFields()}}else if(['1','2','3','4'].includes(e.key))setTool(['select','orbit','launch','delete'][+e.key-1]);else if(e.key.toLowerCase()==='g')$('fieldBtn').click();else if(e.key.toLowerCase()==='f')fit();else if(e.key.toLowerCase()==='c')toggleFollow();else if(e.key.toLowerCase()==='h'||e.key==='?')showHelp();else if(e.key.toLowerCase()==='p')screenshot();else if(e.key==='.')$('stepBtn').click()});
-function sampleTrails(){for(let b of bodies){let last=b.trail[b.trail.length-1];if(!last||Math.hypot(b.x-last.x,b.y-last.y,b.z-last.z)*scale>.7){b.trail.push({x:b.x,y:b.y,z:b.z});if(b.trail.length>650)b.trail.shift()}}}
-let last=performance.now(),uiLast=0,trailLast=0,fpsAcc=0,frames=0;
-function frame(now){let dt=Math.min((now-last)/1000,.05);last=now;fpsAcc+=dt;frames++;if(fpsAcc>.6){lastFPS=frames/fpsAcc;fpsAcc=0;frames=0}if(!paused)simulate(dt*rate);if(now-trailLast>35&&!paused){sampleTrails();trailLast=now}let tracked=bodies.find(b=>b.id===follow);if(tracked&&!(pointer&&pointer.wasPaused!==undefined)){let k=1-Math.exp(-dt*12);cam.x=tracked.x;cam.y=tracked.y;cam.z=tracked.z}draw(now,dt);if(now-uiLast>200){updateStats();uiUpdate();uiLast=now}if(!pointer&&now-lastPred>1800){predict();lastPred=now}requestAnimationFrame(frame)}
-// Compact, deterministic hooks for reproducible offline QA; not used by the UI.
-window.OrbitFoundry={getView:()=>({cam:{...cam},scale,yaw,tilt,W,H}),focusShowcase:()=>{let b=getSelected()||bodies.find(b=>b.kind==='rock');if(!b)return;follow=b.id;cam={x:b.x,y:b.y,z:b.z};scale=targetScale=H*.205/Math.max(b.r,1e-10);tilt=.78;yaw=.05;bodies.forEach(q=>q.trail=[]);$('timeRate').value=-6;setRate();syncFields()},get bodies(){return bodies},get stats(){updateStats();return stats},get time(){return t},get paused(){return paused},loadScene:(s)=>loadScene(s,false),simulate,spawn,unproject,flammHeight,launchVelocity,initialLaunchVelocity,candidate,previewLaunch,safeStep,leap,accel,cancelPointer,get launchPath(){return launchPath},get pointer(){return pointer},get settings(){return settings},payload,restore,pause:()=>{paused=true;updatePause()},select:id=>select(bodies.find(b=>b.id===id)),fit,project,get G(){return G},get energy(){updateStats();return stats.E}};
-loadScene('solar',false);paused=true;updatePause();requestAnimationFrame(frame);
+  function drawBH(b, p, r, now) {
+    let glow = ctx.createRadialGradient(p.x, p.y, r * 0.7, p.x, p.y, r * 7);
+    glow.addColorStop(0, "#ffd4a024");
+    glow.addColorStop(0.35, "#cc713b12");
+    glow.addColorStop(1, "#e0924200");
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r * 7, 0, TAU);
+    ctx.fill();
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(-0.12 + yaw * 0.22);
+    let flat = 0.25 + 0.4 * Math.cos(tilt);
+    for (let i = 9; i >= 0; i--) {
+      ctx.strokeStyle = [
+        "#9d513b40",
+        "#b4603d50",
+        "#de865078",
+        "#f1ac6caa",
+        "#ffe0a0bb",
+      ][Math.min(4, Math.floor((9 - i) / 2))];
+      ctx.lineWidth = Math.max(0.8, r * 0.12);
+      ctx.beginPath();
+      ctx.ellipse(
+        0,
+        0,
+        r * (2.2 + i * 0.26),
+        r * (2.2 + i * 0.26) * flat,
+        0,
+        0,
+        TAU,
+      );
+      ctx.stroke();
+    }
+    ctx.fillStyle = "#020307";
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 1.13, 0, TAU);
+    ctx.fill();
+    ctx.shadowColor = "#ffc28c";
+    ctx.shadowBlur = 10;
+    ctx.strokeStyle = "#ffd29b";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 1.2, 0, TAU);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "#ffe0acaa";
+    ctx.lineWidth = r * 0.3;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r * 3.2, r * 3.2 * flat, 0, 0, Math.PI);
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawBody(b, p, r, now) {
+    if (b.kind === "bh") {
+      drawBH(b, p, r, now);
+      return;
+    }
+    if (b.kind === "star") {
+      let g = ctx.createRadialGradient(p.x, p.y, r * 0.4, p.x, p.y, r * 8);
+      g.addColorStop(0, b.color + "98");
+      g.addColorStop(0.16, b.color + "32");
+      g.addColorStop(0.5, b.color + "0c");
+      g.addColorStop(1, b.color + "00");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 8, 0, TAU);
+      ctx.fill();
+      ctx.shadowColor = b.color;
+      ctx.shadowBlur = r * 1.2;
+      let surf = ctx.createRadialGradient(
+        p.x - r * 0.25,
+        p.y - r * 0.3,
+        0,
+        p.x,
+        p.y,
+        r,
+      );
+      surf.addColorStop(0, "#fff6df");
+      surf.addColorStop(0.6, b.color);
+      surf.addColorStop(1, b.color + "cc");
+      ctx.fillStyle = surf;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, TAU);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      return;
+    }
+    if (b.ring) {
+      ctx.strokeStyle = b.color + "65";
+      ctx.lineWidth = Math.max(1, r * 0.4);
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, r * 2.05, r * 0.55, -0.2, 0, TAU);
+      ctx.stroke();
+    }
+    let light = bodies
+        .filter((x) => x.kind === "star")
+        .sort(
+          (a, c) =>
+            luminosity(c) / ((c.x - b.x) ** 2 + (c.y - b.y) ** 2 + 0.001) -
+            luminosity(a) / ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + 0.001),
+        )[0],
+      lx = -0.5,
+      ly = -0.55;
+    if (light) {
+      let sp = project(light.x, light.y, light.z),
+        dx = sp.x - p.x,
+        dy = sp.y - p.y,
+        d = Math.hypot(dx, dy) || 1;
+      lx = (dx / d) * 0.55;
+      ly = (dy / d) * 0.55;
+    }
+    let g = ctx.createRadialGradient(
+      p.x + r * lx,
+      p.y + r * ly,
+      r * 0.05,
+      p.x - r * lx * 0.4,
+      p.y - r * ly * 0.4,
+      r * 1.3,
+    );
+    g.addColorStop(0, b.color);
+    g.addColorStop(0.48, b.color);
+    g.addColorStop(0.88, "#1d2938");
+    g.addColorStop(1, "#070c15");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, TAU);
+    ctx.fill();
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r - 0.2, 0, TAU);
+    ctx.clip();
+    if (b.kind === "gas") {
+      ctx.globalAlpha = 0.23;
+      for (let i = -3; i <= 3; i++) {
+        ctx.strokeStyle = i % 2 ? "#fff7d4" : "#704b3b";
+        ctx.lineWidth = r * 0.18;
+        ctx.beginPath();
+        ctx.ellipse(p.x, p.y + i * r * 0.25, r * 1.1, r * 0.15, -0.12, 0, TAU);
+        ctx.stroke();
+      }
+    } else if (b.kind === "rock" && r > 3 && b.color === "#79bde8") {
+      ctx.fillStyle = "#9ac49e";
+      ctx.globalAlpha = 0.55;
+      ctx.beginPath();
+      ctx.ellipse(
+        p.x - r * 0.22,
+        p.y - r * 0.1,
+        r * 0.29,
+        r * 0.53,
+        -0.5,
+        0,
+        TAU,
+      );
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(
+        p.x + r * 0.36,
+        p.y + r * 0.25,
+        r * 0.25,
+        r * 0.31,
+        0.3,
+        0,
+        TAU,
+      );
+      ctx.fill();
+      ctx.strokeStyle = "#e7f2fa";
+      ctx.globalAlpha = 0.4;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y - r * 0.3, r * 0.9, r * 0.18, 0.15, 0, TAU);
+      ctx.stroke();
+    }
+    ctx.restore();
+    if (r > 3) {
+      ctx.strokeStyle = b.color + "60";
+      ctx.lineWidth = 0.7;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, TAU);
+      ctx.stroke();
+    }
+  }
+  function drawOrbitalEllipses() {
+    for (let b of bodies) {
+      if (b.kind === "debris" || b.kind === "asteroid" || b.kind === "bh")
+        continue;
+      let el = elements(b);
+      if (!el || el.e > 0.985 || el.a <= 0 || el.c.mass < b.mass * 0.5)
+        continue;
+      let c = el.c,
+        x = b.x - c.x,
+        y = b.y - c.y,
+        z = b.z - c.z,
+        vx = b.vx - c.vx,
+        vy = b.vy - c.vy,
+        vz = b.vz - c.vz,
+        r = Math.hypot(x, y, z),
+        mu = G * (b.mass + c.mass),
+        hx = y * vz - z * vy,
+        hy = z * vx - x * vz,
+        hz = x * vy - y * vx,
+        h = Math.hypot(hx, hy, hz);
+      if (h < 1e-16) continue;
+      let ex = (vy * hz - vz * hy) / mu - x / r,
+        ey = (vz * hx - vx * hz) / mu - y / r,
+        ez = (vx * hy - vy * hx) / mu - z / r,
+        ev = Math.hypot(ex, ey, ez);
+      if (ev < 1e-6) {
+        ex = x / r;
+        ey = y / r;
+        ez = z / r;
+      } else {
+        ex /= ev;
+        ey /= ev;
+        ez /= ev;
+      }
+      let qx = (hy * ez - hz * ey) / h,
+        qy = (hz * ex - hx * ez) / h,
+        qz = (hx * ey - hy * ex) / h,
+        pts = [];
+      for (let i = 0; i <= 128; i++) {
+        let a = (i / 128) * TAU,
+          rr = (h * h) / mu / (1 + el.e * Math.cos(a));
+        pts.push({
+          x: c.x + rr * (ex * Math.cos(a) + qx * Math.sin(a)),
+          y: c.y + rr * (ey * Math.cos(a) + qy * Math.sin(a)),
+          z: c.z + rr * (ez * Math.cos(a) + qz * Math.sin(a)),
+        });
+      }
+      pathWorld(pts, b.color + (b.id === selected ? "42" : "22"), 0.8);
+    }
+  }
+  function draw(now, wallDt) {
+    $("fieldCaption").hidden = !$("curvature").checked;
+    if (window.FoundryRenderer) {
+      window.FoundryRenderer.render(bodies, now, wallDt);
+      ctx.clearRect(0, 0, W, H);
+    } else {
+      drawBackground(now);
+      if ($("curvature").checked) drawCurvature();
+      else if ($("grid").checked) drawGrid();
+    }
+    if ($("orbits").checked) drawOrbitalEllipses();
+    if ($("habitable").checked)
+      for (let b of bodies)
+        if (b.kind === "star") {
+          let l = Math.sqrt(luminosity(b));
+          for (let i = 0; i < 8; i++)
+            circleWorld(
+              b.x,
+              b.y,
+              b.z,
+              (0.95 + i * 0.103) * l,
+              "#85cdaa0b",
+              Math.max(1, 0.1 * l * scale),
+            );
+          circleWorld(b.x, b.y, b.z, 0.95 * l, "#93c4a642");
+          circleWorld(b.x, b.y, b.z, 1.67 * l, "#93c4a642");
+        }
+    if ($("trails").checked) {
+      for (let b of bodies) {
+        if (b.trail.length < 2) continue;
+        let pts = b.trail;
+        ctx.lineWidth = b.id === selected ? 1.2 : 0.75;
+        for (let k = 0; k < 4; k++) {
+          let start = Math.floor((k * pts.length) / 4),
+            end = Math.min(
+              pts.length,
+              Math.ceil(((k + 1) * pts.length) / 4) + 1,
+            );
+          pathWorld(
+            pts.slice(start, end),
+            b.color + ["18", "2b", "4b", "75"][k],
+            b.id === selected ? 1.1 : 0.7,
+          );
+        }
+      }
+    }
+    if ($("prediction").checked && pred.length > 1)
+      pathWorld(pred, "#c2d7eb70", 1, [4, 6]);
+    let labelBoxes = [];
+    let sb = getSelected();
+    if (sb) {
+      let sp = project(sb.x, sb.y, sb.z),
+        sr = screenRadius(sb, sp);
+      ctx.font = "500 11px -apple-system, Segoe UI, sans-serif";
+      labelBoxes.push({
+        id: sb.id,
+        x: sp.x + sr + 12,
+        y: sp.y - 8,
+        w: ctx.measureText(sb.name).width + 7,
+        h: 15,
+      });
+    }
+    let sorted = bodies
+      .map((b) => {
+        let p = project(b.x, b.y, b.z);
+        return { b, p, r: screenRadius(b, p) };
+      })
+      .sort((a, b) => b.p.depth - a.p.depth);
+    hover = null;
+    for (let { b, p, r } of sorted) {
+      if (p.x < -r * 9 || p.x > W + r * 9 || p.y < -r * 9 || p.y > H + r * 9)
+        continue;
+      if (!window.FoundryRenderer) drawBody(b, p, r, now);
+      if (Math.hypot(p.x - mouse.x, p.y - mouse.y) < Math.max(12, r + 5))
+        hover = b;
+      if (b.id === selected) {
+        ctx.strokeStyle = "#c3dff6b0";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 5]);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r + 8, 0, TAU);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#b9d9f1";
+        for (let s of [-1, 1]) {
+          ctx.fillRect(p.x + s * (r + 12) - 1, p.y - 1, 2, 2);
+          ctx.fillRect(p.x - 1, p.y + s * (r + 12) - 1, 2, 2);
+        }
+      }
+      if (
+        $("labels").checked &&
+        ((b.kind !== "debris" && b.kind !== "asteroid") ||
+          b.id === selected ||
+          b === hover)
+      ) {
+        ctx.font =
+          (b.id === selected ? "500 " : "") +
+          "11px -apple-system, Segoe UI, sans-serif";
+        ctx.fillStyle = b.id === selected ? "#e0effd" : "#adc2d6";
+        ctx.textAlign = "left";
+        drawLabel(b, p, r, labelBoxes);
+      }
+      if ($("vectors").checked) {
+        let end = project(b.x + b.vx * 0.1, b.y + b.vy * 0.1, b.z + b.vz * 0.1);
+        arrow(p.x, p.y, end.x, end.y, b.color + "aa");
+      }
+    }
+    for (let e of effects) {
+      e.age += wallDt;
+      let p = project(e.x, e.y, e.z),
+        r = (8 + e.age * 65) * e.size;
+      ctx.globalAlpha = Math.max(0, 1 - e.age / 1.8);
+      let g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+      g.addColorStop(0, e.color + "88");
+      g.addColorStop(1, e.color + "00");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, TAU);
+      ctx.fill();
+      ctx.strokeStyle = e.color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 0.7, 0, TAU);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    effects = effects.filter((e) => e.age < 1.8);
+    if (pointer && tool === "launch" && pointer.button === 0) {
+      let p = project(pointer.world.x, pointer.world.y, pointer.world.z),
+        v = launchVelocity(pointer.world, mouse),
+        total = initialLaunchVelocity(v);
+      let stamp = [
+        mouse.x,
+        mouse.y,
+        $("launchGain").value,
+        $("launchFrame").value,
+        $("spawnMass").value,
+        $("preset").value,
+      ].join(":");
+      if (
+        stamp !== launchPathStamp ||
+        performance.now() - launchPathTime > 500
+      ) {
+        previewLaunch();
+        launchPathStamp = stamp;
+        launchPathTime = performance.now();
+      }
+      if ($("launchPreview").checked && launchPath.length > 1) {
+        pathWorld(launchPath, "#bca6fabb", 1.3, [4, 5]);
+        let last = launchPath[launchPath.length - 1];
+        if (last.hit) {
+          let ep = project(last.x, last.y, last.z);
+          ctx.strokeStyle = "#f7b18f";
+          ctx.beginPath();
+          ctx.arc(ep.x, ep.y, 6, 0, TAU);
+          ctx.stroke();
+        }
+      }
+      arrow(p.x, p.y, mouse.x, mouse.y, "#b8e2ff");
+      if ($("launchFrame").value === "relative" && getSelected()) {
+        let vl = Math.hypot(v.vx, v.vy, v.vz),
+          factor =
+            vl > 0
+              ? Math.hypot(mouse.x - p.x, mouse.y - p.y) / (vl * scale)
+              : 0.2,
+          ep = project(
+            pointer.world.x + total.vx * factor,
+            pointer.world.y + total.vy * factor,
+            pointer.world.z + total.vz * factor,
+          );
+        arrow(p.x, p.y, ep.x, ep.y, "#eec17f");
+      }
+      ctx.font = "12px -apple-system, Segoe UI, sans-serif";
+      ctx.fillStyle = "#e2f0ff";
+      ctx.fillText(
+        "v₀ " +
+          fmt(Math.hypot(total.vx, total.vy, total.vz) * VUNIT, 2) +
+          " км/с · " +
+          ($("launchFrame").value === "world" ? "мировая" : "относительная"),
+        mouse.x + 13,
+        mouse.y - 12,
+      );
+      ctx.fillStyle = "#c6b7eb";
+      ctx.fillText(
+        "Пунктир — гравитационный прогноз",
+        mouse.x + 13,
+        mouse.y + 7,
+      );
+    }
+    if (
+      (tool === "orbit" || tool === "launch") &&
+      !pointer &&
+      mouse.x > 300 &&
+      mouse.x < W - 320 &&
+      mouse.y > 80 &&
+      mouse.y < H - 100
+    ) {
+      let w = unproject(mouse.x, mouse.y, Number($("spawnZ").value) || 0),
+        p = project(w.x, w.y, w.z);
+      ctx.strokeStyle = "#a9d8ff88";
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 8, 0, TAU);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      let c =
+        tool === "orbit"
+          ? bodies.find((b) => b.id === orbitAnchor) || getSelected()
+          : getSelected();
+      if (tool === "orbit" && c) {
+        let r = Math.hypot(w.x - c.x, w.y - c.y, w.z - c.z);
+        circleWorld(c.x, c.y, c.z, r, "#b9d4ec30", 1);
+      }
+    }
+    cv.style.cursor = pointer
+      ? pointer.button === 2
+        ? "grabbing"
+        : tool === "launch"
+          ? "crosshair"
+          : "grabbing"
+      : tool === "delete"
+        ? "not-allowed"
+        : tool !== "select"
+          ? "crosshair"
+          : hover
+            ? "pointer"
+            : "grab";
+    drawCompass();
+  }
+  function drawLabel(b, p, r, boxes) {
+    let w = ctx.measureText(b.name).width + 7,
+      h = 15,
+      own = boxes.find((q) => q.id === b.id);
+    let candidates = own
+      ? [{ x: own.x, y: own.y }]
+      : [
+          { x: p.x + r + 12, y: p.y - 8 },
+          { x: p.x + r + 10, y: p.y - 25 },
+          { x: p.x - w - r - 9, y: p.y - 8 },
+          { x: p.x + r + 10, y: p.y + 10 },
+        ];
+    for (let pos of candidates) {
+      if (
+        b.id !== selected &&
+        boxes.some(
+          (q) =>
+            q.id !== b.id &&
+            pos.x < q.x + q.w &&
+            pos.x + w > q.x &&
+            pos.y < q.y + q.h &&
+            pos.y + h > q.y,
+        )
+      )
+        continue;
+      ctx.fillText(b.name, pos.x, pos.y + 12);
+      if (!own) boxes.push({ id: b.id, x: pos.x, y: pos.y, w, h });
+      return;
+    }
+  }
+  function drawCompass() {
+    let x = W - 342,
+      y = H - 153;
+    ctx.font = "10px -apple-system, Segoe UI, sans-serif";
+    let origin = project(cam.x, cam.y, cam.z);
+    for (let a of [
+      { v: [1, 0, 0], c: "#da9b96", s: "X" },
+      { v: [0, 1, 0], c: "#a2c4a0", s: "Y" },
+      { v: [0, 0, 1], c: "#8fb9e4", s: "Z" },
+    ]) {
+      let p = project(
+          cam.x + (a.v[0] / scale) * 27,
+          cam.y + (a.v[1] / scale) * 27,
+          cam.z + (a.v[2] / scale) * 27,
+        ),
+        dx = p.x - origin.x,
+        dy = p.y - origin.y;
+      ctx.strokeStyle = a.c;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + dx, y + dy);
+      ctx.stroke();
+      ctx.fillStyle = a.c;
+      ctx.fillText(a.s, x + dx + 3, y + dy + 3);
+    }
+  }
+  function arrow(x, y, ex, ey, color) {
+    let a = Math.atan2(ey - y, ex - x),
+      d = Math.hypot(ex - x, ey - y);
+    if (d < 1) return;
+    if (d > 150 && !(pointer && tool === "launch")) {
+      ex = x + Math.cos(a) * 150;
+      ey = y + Math.sin(a) * 150;
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(ex, ey);
+    ctx.lineTo(ex - Math.cos(a - 0.4) * 8, ey - Math.sin(a - 0.4) * 8);
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - Math.cos(a + 0.4) * 8, ey - Math.sin(a + 0.4) * 8);
+    ctx.stroke();
+  }
+  function predict() {
+    let b = getSelected();
+    pred = [];
+    if (!b || !$("prediction").checked || bodies.length > 100) return;
+    let el = elements(b),
+      horizon =
+        el && Number.isFinite(el.period)
+          ? Math.min(el.period * 1.12, 10000)
+          : Math.max(rate * 20, 0.05);
+    let copies = bodies.map((b) => ({ ...b, trail: null })),
+      idx = bodies.indexOf(b),
+      dt = horizon / 220,
+      minDist = Infinity;
+    for (let a of copies)
+      if (a.id !== b.id)
+        minDist = Math.min(
+          minDist,
+          Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        );
+    if (!Number.isFinite(dt) || dt <= 0) return;
+    let start = performance.now(),
+      elapsed = 0;
+    pred.push({ x: b.x, y: b.y, z: b.z });
+    for (let i = 0; i < 240; i++) {
+      let target = elapsed + dt;
+      for (let k = 0; k < 12 && elapsed < target; k++) {
+        let q = copies[idx],
+          safe = dt;
+        for (let a of copies) {
+          if (a === q) continue;
+          let r2 =
+            (q.x - a.x) ** 2 +
+            (q.y - a.y) ** 2 +
+            (q.z - a.z) ** 2 +
+            settings.soft ** 2;
+          safe = Math.min(
+            safe,
+            0.06 * Math.sqrt(r2 ** 1.5 / (G * (q.mass + a.mass))),
+          );
+        }
+        let step = Math.min(target - elapsed, safe);
+        leap(step, copies);
+        elapsed += step;
+        if (performance.now() - start > 13) break;
+      }
+      let q = copies[idx];
+      pred.push({ x: q.x, y: q.y, z: q.z });
+      if (performance.now() - start > 13) break;
+    }
+  }
+  function uiUpdate() {
+    let b = getSelected();
+    $("nBodies").textContent =
+      bodies.length + " " + (bodies.length === 1 ? "тело" : "тел");
+    $("simTime").textContent =
+      t < 1 / 365.25
+        ? fmt(t * YR, 0) + " с"
+        : t < 1
+          ? fmt(t * 365.25, 2) + " дней"
+          : fmt(t, 2) + " лет";
+    $("energyLabel").textContent =
+      (settings.rel ? "ΔEₙ " : "ΔE ") + fmt(stats.drift * 100, 3) + "%";
+    $("energyLabel").style.color =
+      Math.abs(stats.drift) > 0.01 ? "var(--gold)" : "var(--text)";
+    $("totalMass").textContent = fmt(stats.mass, 5) + " M☉";
+    $("totalMomentum").textContent = fmt(stats.p, 6);
+    $("energyDrift").textContent = fmt(stats.drift * 100, 4) + "%";
+    $("stepCount").textContent = steps;
+    $("bodyCount").textContent = bodies.length + " / " + MAX;
+    $("cameraLabel").textContent = follow
+      ? getSelected()?.id === follow
+        ? "За объектом"
+        : "Слежение"
+      : "Свободная";
+    $("fps").textContent = Math.round(lastFPS) + " FPS";
+    $("simStatus").textContent = paused
+      ? "пауза"
+      : limited
+        ? "CPU: время замедлено"
+        : "адаптивный шаг";
+    $("simStatus").style.color = limited ? "var(--gold)" : "var(--muted)";
+    $("viewLabel").textContent =
+      tilt < 0.01 ? "Ортогональная плоскость XY" : "Перспектива · XY + Z";
+    let s = 10 ** Math.floor(Math.log10(100 / scale));
+    if (s * scale < 40) s *= 5;
+    else if (s * scale < 75) s *= 2;
+    $("scaleText").textContent =
+      s < 0.001 ? fmt(s * AU, 0) + " км" : fmt(s, 3) + " а.е.";
+    $("scaleLine").style.width = s * scale + "px";
+    if (b) {
+      $("bodyName").textContent = b.name;
+      $("metricVel").textContent =
+        fmt(Math.hypot(b.vx, b.vy, b.vz) * VUNIT, 2) + " км/с";
+      $("metricDist").textContent =
+        fmt(
+          Math.hypot(b.x - stats.com.x, b.y - stats.com.y, b.z - stats.com.z),
+          4,
+        ) + " а.е.";
+      $("metricAcc").textContent =
+        fmt((Math.hypot(b.ax, b.ay, b.az) * AU * 1000) / YR ** 2, 4) + " м/с²";
+      let temp = temperature(b);
+      $("metricTemp").textContent = b.kind === "bh" ? "—" : fmt(temp, 0) + " K";
+      let hole = bodies
+        .filter((a) => a.kind === "bh" && a !== b)
+        .sort(
+          (a, c) =>
+            c.mass / Math.hypot(c.x - b.x, c.y - b.y, c.z - b.z) -
+            a.mass / Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        )[0];
+      let distance = hole
+        ? Math.hypot(b.x - hole.x, b.y - hole.y, b.z - hole.z)
+        : 0;
+      let clock =
+        hole && distance > hole.r ? Math.sqrt(1 - hole.r / distance) : null;
+      $("metricClock").textContent =
+        clock !== null
+          ? fmt(clock, 6) + "×"
+          : hole
+            ? "за горизонтом"
+            : "нет ЧД";
+      let center = dominant(b);
+      $("metricEscape").textContent = center
+        ? fmt(
+            Math.sqrt(
+              (2 * G * (b.mass + center.mass)) /
+                Math.max(
+                  center.r,
+                  Math.hypot(b.x - center.x, b.y - center.y, b.z - center.z),
+                ),
+            ) * VUNIT,
+            2,
+          ) + " км/с"
+        : "—";
+      let el = elements(b);
+      $("metricOrbit").textContent = el
+        ? fmt(el.a, 3) + " / " + fmt(el.e, 3)
+        : "—";
+      $("metricPeriod").textContent = el
+        ? Number.isFinite(el.period)
+          ? el.period < 1 / 365
+            ? fmt(el.period * YR, 1) + " с"
+            : el.period < 1
+              ? fmt(el.period * 365.25, 2) + " дн"
+              : fmt(el.period, 2) + " лет"
+          : "незамкнутая"
+        : "—";
+      $("followBtn").classList.toggle("active", follow === b.id);
+      updateLaunchNote();
+    } else
+      for (let id of [
+        "metricVel",
+        "metricDist",
+        "metricAcc",
+        "metricTemp",
+        "metricClock",
+        "metricEscape",
+        "metricOrbit",
+        "metricPeriod",
+      ])
+        $(id).textContent = "—";
+    if (dirtyList) {
+      $("bodyList").replaceChildren(
+        ...bodies.map((b) => {
+          let bt = document.createElement("button");
+          bt.className = "body-item" + (b.id === selected ? " active" : "");
+          let sw = document.createElement("span");
+          sw.className = "swatch";
+          sw.style.background = b.color;
+          let name = document.createElement("span");
+          name.textContent = b.name;
+          let m = document.createElement("small");
+          m.textContent = fmt(b.mass, 3);
+          bt.append(sw, name, m);
+          bt.onclick = () => {
+            select(b);
+            if (tool === "orbit") {
+              orbitAnchor = b.id;
+              updateOrbitNote();
+            }
+            if (tool === "select") focusPlanet();
+          };
+          return bt;
+        }),
+      );
+      dirtyList = false;
+    }
+  }
+  function cancelPointer() {
+    if (pointer && pointer.wasPaused !== undefined) {
+      paused = pointer.wasPaused;
+      updatePause();
+    }
+    pointer = null;
+    launchPath = [];
+    launchPathStamp = "";
+  }
+  function updateOrbitNote() {
+    if (tool !== "orbit") return;
+    let c = bodies.find((b) => b.id === orbitAnchor) || getSelected();
+    $("toolDescription").textContent = c
+      ? "Центр: «" +
+        c.name +
+        "» закреплён. Щёлкните по другому телу, чтобы сменить центр."
+      : "Нет центра: сначала создайте звезду.";
+  }
+  function updateLaunchNote() {
+    let b = getSelected(),
+      relative = $("launchFrame").value === "relative";
+    $("launchFrameNote").textContent = relative
+      ? b
+        ? "К скорости стрелки добавится скорость «" +
+          b.name +
+          "». Золотая стрелка — итоговая."
+        : "Нет опорного тела: запуск в мировой системе."
+      : "Мировая система: скорость других тел не наследуется. Прицеливание ставит время на паузу.";
+  }
+  function setTool(tl) {
+    cancelPointer();
+    tool = tl;
+    if (tl !== "select" && window.showLeft) window.showLeft("create");
+    if (tl === "orbit") orbitAnchor = selected;
+    $("launchControls").hidden = tl !== "launch";
+    updateLaunchNote();
+    document
+      .querySelectorAll("[data-tool]")
+      .forEach((b) => b.classList.toggle("active", b.dataset.tool === tl));
+    let text = {
+      select: "Выберите тело. ЛКМ по пустоте — перемещение камеры.",
+      orbit:
+        "Выберите центр притяжения, затем щёлкните: тело получит круговую скорость.",
+      launch:
+        "Стрелка — начальная скорость, пунктир — путь под действием гравитации. Прицеливание приостанавливает время.",
+      delete: "Щёлкните по телу, чтобы удалить его. Масса и энергия изменятся.",
+    };
+    $("toolDescription").textContent = text[tl];
+    updateOrbitNote();
+    $("hint").textContent =
+      tl === "select"
+        ? "Двойной щелчок — к объекту · ПКМ — осмотреть · Колесо / + − — приблизить"
+        : text[tl];
+  }
+  document
+    .querySelectorAll("[data-tool]")
+    .forEach((b) => (b.onclick = () => setTool(b.dataset.tool)));
+  function pick(x, y) {
+    let best = null,
+      dist = Infinity;
+    for (let b of bodies) {
+      let p = project(b.x, b.y, b.z),
+        r = screenRadius(b, p),
+        d = Math.hypot(x - p.x, y - p.y);
+      if (d < Math.max(12, r + 6) && d < dist) {
+        best = b;
+        dist = d;
+      }
+    }
+    return best;
+  }
+  function launchVelocity(world, end) {
+    let w = unproject(end.x, end.y, world.z),
+      p = project(world.x, world.y, world.z),
+      dx = w.x - world.x,
+      dy = w.y - world.y,
+      d = Math.hypot(dx, dy),
+      gain = Number($("launchGain").value),
+      pixels = Math.hypot(end.x - p.x, end.y - p.y);
+    if (
+      !Number.isFinite(gain) ||
+      gain < 0.001 ||
+      gain > 100000 ||
+      d < 1e-15 ||
+      pixels < 1
+    )
+      return { vx: 0, vy: 0, vz: 0 };
+    let speed = ((pixels / 100) * gain) / VUNIT;
+    return { vx: (dx / d) * speed, vy: (dy / d) * speed, vz: 0 };
+  }
+  function initialLaunchVelocity(v) {
+    let ref = $("launchFrame").value === "relative" ? getSelected() : null;
+    return {
+      vx: v.vx + (ref?.vx || 0),
+      vy: v.vy + (ref?.vy || 0),
+      vz: v.vz + (ref?.vz || 0),
+    };
+  }
+  function candidate(world, velocity) {
+    let p = presets[$("preset").value],
+      m = Number($("spawnMass").value);
+    if (!Number.isFinite(m) || m < 1e-14 || m > 1e9) return null;
+    let r =
+      p.kind === "bh" ? (2 * G * m) / C ** 2 : p.r * Math.cbrt(m / p.mass);
+    return {
+      id: -1,
+      name: "Предпросмотр",
+      kind: p.kind,
+      mass: m,
+      r,
+      x: world.x,
+      y: world.y,
+      z: world.z,
+      ...velocity,
+      ax: 0,
+      ay: 0,
+      az: 0,
+    };
+  }
+  function previewLaunch() {
+    launchPath = [];
+    if (
+      !pointer ||
+      tool !== "launch" ||
+      !$("launchPreview").checked ||
+      bodies.length > 100
+    )
+      return;
+    let q = candidate(
+      pointer.world,
+      initialLaunchVelocity(launchVelocity(pointer.world, mouse)),
+    );
+    if (!q) return;
+    let arr = bodies.map((b) => ({ ...b, trail: null }));
+    arr.push(q);
+    let horizon = Infinity;
+    for (let b of bodies) {
+      let r = Math.hypot(q.x - b.x, q.y - b.y, q.z - b.z),
+        v = Math.hypot(q.vx - b.vx, q.vy - b.vy, q.vz - b.vz);
+      horizon = Math.min(
+        horizon,
+        4 * Math.sqrt(r ** 3 / (G * (q.mass + b.mass))),
+        (6 * r) / (v + 1e-20),
+      );
+    }
+    if (!Number.isFinite(horizon))
+      horizon = Math.max(
+        rate * 8,
+        2 / Math.max(Math.hypot(q.vx, q.vy, q.vz), 0.01),
+      );
+    horizon = Math.max(1e-12, Math.min(horizon, 1000));
+    let elapsed = 0,
+      next = 0,
+      started = performance.now();
+    launchPath.push({ x: q.x, y: q.y, z: q.z, elapsed });
+    for (let k = 0; k < 1600 && elapsed < horizon; k++) {
+      let dt = Math.min(horizon / 240, safeStep(arr), horizon - elapsed);
+      if (!(dt > 0)) break;
+      leap(dt, arr);
+      elapsed += dt;
+      if (elapsed >= next) {
+        launchPath.push({ x: q.x, y: q.y, z: q.z, elapsed });
+        next = elapsed + horizon / 300;
+      }
+      if (
+        arr.some(
+          (b) =>
+            b !== q &&
+            Math.hypot(q.x - b.x, q.y - b.y, q.z - b.z) <
+              (b.kind === "bh" ? b.r : b.r + q.r),
+        )
+      ) {
+        launchPath.push({ x: q.x, y: q.y, z: q.z, hit: true });
+        break;
+      }
+      if (k % 8 === 0 && performance.now() - started > 12) break;
+    }
+  }
+  $("launchFrame").onchange = () => {
+    updateLaunchNote();
+    launchPathStamp = "";
+  };
+  $("launchGain").oninput = () => (launchPathStamp = "");
+  function spawn(world, vel = null, orb = false) {
+    if (bodies.length >= MAX) {
+      notify("Лимит: " + MAX + " тел. Удалите несколько объектов.");
+      return;
+    }
+    let p = presets[$("preset").value],
+      mass = Number($("spawnMass").value),
+      z = Number($("spawnZ").value);
+    if (
+      !Number.isFinite(mass) ||
+      mass < 1e-14 ||
+      mass > 1e9 ||
+      !Number.isFinite(z) ||
+      Math.abs(z) > 1e8
+    ) {
+      notify("Проверьте массу (10⁻¹⁴…10⁹ M☉) и высоту.");
+      return;
+    }
+    let c = orb
+        ? bodies.find((b) => b.id === orbitAnchor) || getSelected()
+        : getSelected(),
+      oldCV = c ? { vx: c.vx, vy: c.vy, vz: c.vz } : null,
+      b = body({
+        ...p,
+        name: p.name + " " + nextId,
+        mass,
+        r: p.r * Math.cbrt(mass / p.mass),
+        x: world.x,
+        y: world.y,
+        z,
+      });
+    if (
+      bodies.some(
+        (a) =>
+          a !== b && Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) < a.r + b.r,
+      )
+    ) {
+      removeBody(b, true);
+      notify("Точка внутри физического тела. Выберите место дальше.");
+      return;
+    }
+    if (c) {
+      if (Math.hypot(b.x - c.x, b.y - c.y, b.z - c.z) < c.r + b.r) {
+        removeBody(b, true);
+        notify("Точка внутри физического тела. Выберите место дальше.");
+        return;
+      }
+      if (orb) {
+        let v = orbitVel(b, c);
+        if (v) {
+          let m = c.mass + b.mass,
+            cx = c.vx,
+            cy = c.vy,
+            cz = c.vz;
+          c.vx = cx - (v.vx * b.mass) / m;
+          c.vy = cy - (v.vy * b.mass) / m;
+          c.vz = cz - (v.vz * b.mass) / m;
+          b.vx = cx + (v.vx * c.mass) / m;
+          b.vy = cy + (v.vy * c.mass) / m;
+          b.vz = cz + (v.vz * c.mass) / m;
+        }
+      } else {
+        let v = initialLaunchVelocity(vel || { vx: 0, vy: 0, vz: 0 });
+        b.vx = v.vx;
+        b.vy = v.vy;
+        b.vz = v.vz;
+      }
+    } else if (vel) {
+      b.vx = vel.vx;
+      b.vy = vel.vy;
+      b.vz = vel.vz;
+    }
+    if (
+      ![b.vx, b.vy, b.vz].every(Number.isFinite) ||
+      Math.hypot(b.vx, b.vy, b.vz) >= C * 0.99
+    ) {
+      if (c && oldCV) {
+        c.vx = oldCV.vx;
+        c.vy = oldCV.vy;
+        c.vz = oldCV.vz;
+      }
+      removeBody(b, true);
+      notify(
+        "Скорость должна быть меньше 0,99 c. Уменьшите длину стрелки или её масштаб.",
+      );
+      return;
+    }
+    if (orb && !c) orbitAnchor = b.id;
+    select(b);
+    updateOrbitNote();
+    event("Создано: " + b.name);
+    notify(
+      orb && c
+        ? "Тело выведено на начальную круговую орбиту."
+        : "Создано: " + b.name,
+    );
+    accel(bodies);
+  }
+  cv.oncontextmenu = (e) => e.preventDefault();
+  cv.addEventListener("pointerdown", (e) => {
+    if (pointer) return;
+    if (e.button !== 0 && e.button !== 2 && e.button !== 1) return;
+    cameraFlight = null;
+    mouse = { x: e.clientX, y: e.clientY };
+    pointer = {
+      button: e.button,
+      x: e.clientX,
+      y: e.clientY,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      moved: false,
+      hit: pick(e.clientX, e.clientY),
+      world: unproject(e.clientX, e.clientY, Number($("spawnZ").value) || 0),
+    };
+    if (tool === "launch" && e.button === 0) {
+      pointer.wasPaused = paused;
+      paused = true;
+      follow = null;
+      updatePause();
+    }
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener("pointermove", (e) => {
+    mouse = { x: e.clientX, y: e.clientY };
+    if (!pointer) return;
+    let dx = e.clientX - pointer.lastX,
+      dy = e.clientY - pointer.lastY;
+    if (Math.hypot(e.clientX - pointer.x, e.clientY - pointer.y) > 4)
+      pointer.moved = true;
+    if (pointer.button === 2) {
+      yaw += dx * 0.006;
+      tilt = Math.max(0.025, Math.min(Math.PI - 0.025, tilt + dy * 0.005));
+      $("view3d").classList.toggle("active", tilt > 0.01);
+      $("viewTop").classList.toggle("active", tilt <= 0.01);
+    } else if (pointer.button === 1 || (tool === "select" && pointer.moved)) {
+      let a = unproject(pointer.lastX, pointer.lastY, cam.z),
+        b = unproject(e.clientX, e.clientY, cam.z);
+      cam.x += a.x - b.x;
+      cam.y += a.y - b.y;
+      follow = null;
+    }
+    pointer.lastX = e.clientX;
+    pointer.lastY = e.clientY;
+  });
+  cv.addEventListener("pointerup", (e) => {
+    if (!pointer) return;
+    let p = pointer;
+    pointer = null;
+    if (p.button !== 0) return;
+    let b = pick(e.clientX, e.clientY);
+    if (tool === "select" && !p.moved) {
+      select(b);
+      if (follow) follow = b?.id || null;
+    } else if (tool === "delete" && !p.moved && b) {
+      removeBody(b);
+      syncFields();
+    } else if (tool === "orbit" && !p.moved) {
+      if (p.hit) {
+        orbitAnchor = p.hit.id;
+        select(p.hit);
+        updateOrbitNote();
+        notify("Центр орбиты: " + p.hit.name);
+      } else spawn(p.world, null, true);
+    } else if (tool === "launch") {
+      let gain = Number($("launchGain").value);
+      if (Number.isFinite(gain) && gain >= 0.001 && gain <= 100000)
+        spawn(p.world, launchVelocity(p.world, mouse), false);
+      else
+        notify(
+          "Масштаб скорости должен быть от 0,001 до 100 000 км/с на 100 px.",
+        );
+      paused = p.wasPaused ?? paused;
+      updatePause();
+      launchPath = [];
+      launchPathStamp = "";
+    }
+  });
+  cv.addEventListener("pointercancel", cancelPointer);
+  cv.addEventListener("lostpointercapture", () => {
+    if (pointer) cancelPointer();
+  });
+  function maxZoom() {
+    let b = bodies.find(b=>b.id===follow);
+    return b ? Math.min(1e10,H/(2*Math.tan(21*Math.PI/180)*b.r*1.25*Math.max(.4,Number($("sizeScale").value)))) : 1e10;
+  }
+  function zoomBy(factor) {cameraFlight=null;targetScale=Math.max(.00001,Math.min(maxZoom(),targetScale*factor));}
+  cv.addEventListener("wheel",e=>{e.preventDefault();zoomBy(Math.exp(-Math.max(-500,Math.min(500,e.deltaY*(e.deltaMode===1?16:1)))*.0022));},{passive:false});
+  cv.addEventListener("dblclick",e=>{let b=pick(e.clientX,e.clientY);if(b){select(b);focusPlanet();}});
+  function focusPlanet(immediate=false){
+    immediate=immediate||matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let b=getSelected()||bodies.find(b=>b.planet==='earth')||bodies[0];if(!b)return;
+    let sun=bodies.find(q=>q.kind==='star'&&q.id!==b.id), angle=sun?Math.atan2(sun.x-b.x,sun.y-b.y)-.32:0.15;
+    angle=yaw+Math.atan2(Math.sin(angle-yaw),Math.cos(angle-yaw));
+    let availableW=Math.max(240,W-(W<1250?530:610)),availableH=Math.max(220,H-390);
+    let ring=b.ring?1.85:1.08,endScale=Math.min(availableW*.40,availableH*.36)/(b.r*ring*Math.max(.4,Number($("sizeScale").value)));
+    const switching=follow!==b.id;follow=b.id;
+    if(switching&&!immediate){cam={x:b.x,y:b.y,z:b.z};scale=targetScale=endScale*.58;}
+    if(immediate){cam={x:b.x,y:b.y,z:b.z};scale=targetScale=endScale;yaw=angle;tilt=1.04;cameraFlight=null;}
+    else cameraFlight={id:b.id,start:performance.now(),duration:1000,cam:{...cam},scale,yaw,tilt,endScale,endYaw:angle};
+    syncFields();
+  }
+  function fit() {
+    cameraFlight=null;
+    follow = null;
+    if (!bodies.length) {
+      cam = vec();
+      scale = targetScale = 130;
+      return;
+    }
+    let xs = bodies.map((b) => b.x),
+      ys = bodies.map((b) => b.y),
+      zs = bodies.map((b) => b.z);
+    cam = {
+      x: (Math.min(...xs) + Math.max(...xs)) / 2,
+      y: (Math.min(...ys) + Math.max(...ys)) / 2,
+      z: (Math.min(...zs) + Math.max(...zs)) / 2,
+    };
+    scale = 1;
+    let pts = bodies.map((b) => project(b.x, b.y, b.z)),
+      rx = Math.max(...pts.map((p) => Math.abs(p.x - W / 2))),
+      ry = Math.max(...pts.map((p) => Math.abs(p.y - H / 2)));
+    scale = targetScale = Math.min(
+      (W - 680) / Math.max(rx * 2, 1e-10),
+      (H - 270) / Math.max(ry * 2, 1e-10),
+    );
+    scale = Math.max(0.00001, Math.min(1e10, scale));
+    targetScale = scale;
+    notify("Вся система в кадре");
+  }
+  function toggleFollow() {
+    let b = getSelected();
+    if (!b) return;
+    follow = follow === b.id ? null : b.id;
+    if (follow) cam = { x: b.x, y: b.y, z: b.z };
+    syncFields();
+  }
+  $("followBtn").onclick = toggleFollow;
+  $("focusBtn").onclick = () => focusPlanet();
+  $("fitBtn").onclick = fit;
+  $("view3d").onclick = () => {
+    tilt = 0.58;
+    yaw = -0.28;
+    $("view3d").classList.add("active");
+    $("viewTop").classList.remove("active");
+  };
+  $("viewTop").onclick = () => {
+    tilt = 0;
+    yaw = 0;
+    $("viewTop").classList.add("active");
+    $("view3d").classList.remove("active");
+  };
+  $("clearTrails").onclick = () => {
+    bodies.forEach((b) => (b.trail = []));
+    notify("Следы очищены");
+  };
+  $("sizeScale").oninput = () =>
+    ($("sizeValue").textContent = $("sizeScale").value + "×");
+  $("preset").onchange = () =>
+    ($("spawnMass").value = presets[$("preset").value].mass.toExponential(3));
+  $("applyBtn").onclick = () => {
+    let b = getSelected();
+    if (!b) return;
+    let m = Number($("editMass").value),
+      r = Number($("editRadius").value) / AU,
+      vx = Number($("editVx").value) / VUNIT,
+      vy = Number($("editVy").value) / VUNIT,
+      vz = Number($("editVz").value) / VUNIT;
+    if (
+      ![m, r, vx, vy, vz].every(Number.isFinite) ||
+      m < 1e-14 ||
+      m > 1e9 ||
+      r <= 0 ||
+      r > 1e11 / AU ||
+      Math.hypot(vx, vy, vz) > C * 0.99
+    ) {
+      notify(
+        "Недопустимые значения: проверьте массу, радиус и скорость (< 0,99 c).",
+      );
+      return;
+    }
+    b.mass = m;
+    b.r = b.kind === "bh" ? (2 * G * m) / (C * C) : r;
+    b.vx = vx;
+    b.vy = vy;
+    b.vz = vz;
+    b.name = $("editName").value.trim() || "Без имени";
+    b.color = $("editColor").value;
+    b.trail = [];
+    baselineDirty = true;
+    dirtyList = true;
+    pred = [];
+    accel(bodies);
+    syncFields();
+    event("Изменены параметры: " + b.name);
+    notify("Параметры применены");
+  };
+  $("removeBtn").onclick = () => {
+    let b = getSelected();
+    if (b) {
+      removeBody(b);
+      syncFields();
+    }
+  };
+  $("circularBtn").onclick = () => {
+    let b = getSelected(),
+      c = b && dominant(b);
+    if (!c) {
+      notify("Нужно второе тело — центр притяжения.");
+      return;
+    }
+    setCircular(b, c);
+    b.trail = [];
+    pred = [];
+    event("Круговая скорость: " + b.name);
+    notify("Орбита относительно " + c.name + " скорректирована");
+  };
+  function burn(sign) {
+    let b = getSelected();
+    if (!b) return;
+    let c = dominant(b),
+      vx = b.vx - (c?.vx || 0),
+      vy = b.vy - (c?.vy || 0),
+      vz = b.vz - (c?.vz || 0),
+      v = Math.hypot(vx, vy, vz),
+      dv = (Number($("burn").value) / VUNIT) * sign;
+    if (!Number.isFinite(dv) || Math.abs(dv) > C * 0.9) {
+      notify("Проверьте величину импульса.");
+      return;
+    }
+    if (v < 1e-15) {
+      notify("Нет направления скорости. Задайте Vx или Vy.");
+      return;
+    }
+    b.vx += (dv * vx) / v;
+    b.vy += (dv * vy) / v;
+    b.vz += (dv * vz) / v;
+    baselineDirty = true;
+    pred = [];
+    syncFields();
+    event("Манёвр " + b.name + ": " + fmt(dv * VUNIT, 2) + " км/с");
+    notify("Импульс приложен");
+  }
+  $("prograde").onclick = () => burn(1);
+  $("retrograde").onclick = () => burn(-1);
+  $("beltBtn").onclick = () => {
+    let c = getSelected();
+    if (!c) {
+      notify("Сначала выберите центральное тело.");
+      return;
+    }
+    if (bodies.length + 24 > MAX) {
+      notify("Для пояса нужно 24 свободных места.");
+      return;
+    }
+    let host = dominant(c),
+      hill =
+        host && host.mass > c.mass * 10
+          ? Math.hypot(c.x - host.x, c.y - host.y, c.z - host.z) *
+            Math.cbrt(c.mass / (3 * host.mass))
+          : Infinity;
+    let base = Math.max(c.r * 4, Math.min((0.8 * 150) / scale, hill * 0.24));
+    for (let i = 0; i < 24; i++) {
+      let a = rand() * TAU,
+        d = base * (1 + rand() * 0.65);
+      orbitBody(c, { ...presets.asteroid, name: "Астероид " + nextId }, d, a, {
+        inc: (rand() - 0.5) * 0.09,
+      });
+    }
+    baselineDirty = true;
+    event("Добавлен пояс: 24 тела");
+    notify("Добавлен пояс из 24 астероидов");
+  };
+  $("cometBtn").onclick = () => {
+    let c = getSelected();
+    if (!c) {
+      notify("Выберите центр притяжения.");
+      return;
+    }
+    if (bodies.length >= MAX) {
+      notify("Достигнут лимит тел.");
+      return;
+    }
+    let host = dominant(c),
+      hill =
+        host && host.mass > c.mass * 10
+          ? Math.hypot(c.x - host.x, c.y - host.y, c.z - host.z) *
+            Math.cbrt(c.mass / (3 * host.mass))
+          : Infinity;
+    let d = Math.max(c.r * 12, Math.min(300 / scale, hill * 0.65)),
+      a = rand() * TAU;
+    let b = orbitBody(
+      c,
+      {
+        ...presets.asteroid,
+        name: "Комета " + nextId,
+        color: "#c1e4e9",
+        mass: 1e-13,
+        r: 12 / AU,
+      },
+      d,
+      a,
+      { inc: 0.4 },
+    );
+    b.vx = c.vx + (b.vx - c.vx) * 0.4;
+    b.vy = c.vy + (b.vy - c.vy) * 0.4;
+    b.vz = c.vz + (b.vz - c.vz) * 0.4;
+    select(b);
+    event("Добавлена комета на вытянутой орбите");
+    notify("Комета направляется к перицентру");
+  };
+  document.querySelectorAll("[data-tab]").forEach(
+    (bt) =>
+      (bt.onclick = () => {
+        document
+          .querySelectorAll("[data-tab]")
+          .forEach((b) => b.classList.toggle("active", b === bt));
+        document
+          .querySelectorAll(".tab-pane")
+          .forEach((p) => (p.hidden = p.id !== "tab-" + bt.dataset.tab));
+      }),
+  );
+  $("collision").onchange = () => {
+    settings.collision = $("collision").value;
+    baselineDirty = true;
+  };
+  $("accuracy").onchange = () =>
+    (settings.accuracy = Number($("accuracy").value));
+  $("softening").onchange = () => {
+    let v = Number($("softening").value);
+    if (!Number.isFinite(v) || v < 1e-10 || v > 1) {
+      $("softening").value = settings.soft;
+      notify("ε должно быть от 10⁻¹⁰ до 1 а.е.");
+      return;
+    }
+    settings.soft = v;
+    baselineDirty = true;
+    pred = [];
+  };
+  $("tides").onchange = () => (settings.tides = $("tides").checked);
+  $("grRel").onchange = () => {
+    settings.rel = $("grRel").checked;
+    baselineDirty = true;
+  };
+  $("zeroMomentum").onclick = () => {
+    centerMomentum();
+    syncFields();
+    event("Переход в систему центра масс");
+    notify("Центр масс покоится в начале координат");
+  };
+  function updatePause() {
+    $("pauseBtn").textContent = paused ? "▶" : "Ⅱ";
+    $("pauseBtn").setAttribute(
+      "aria-label",
+      paused ? "Продолжить" : "Приостановить",
+    );
+    $("liveText").textContent = paused ? "ПАУЗА" : "СИМУЛЯЦИЯ";
+    $("liveDot").style.background = paused ? "var(--gold)" : "var(--green)";
+  }
+  function togglePause() {
+    paused = !paused;
+    updatePause();
+  }
+  $("pauseBtn").onclick = togglePause;
+  $("stepBtn").onclick = () => {
+    paused = true;
+    simulate(Math.max(1e-12, Math.min(rate / 60, safeStep())));
+    updatePause();
+    sampleTrails();
+    updateStats();
+    uiUpdate();
+  };
+  $("resetBtn").onclick = () => loadScene(scenario);
+  $("clearBtn").onclick = () => {if(confirm("Удалить все тела?")){bodies=[];selected=follow=null;cameraFlight=null;dirtyList=true;syncFields();}};
+  function payload() {
+    return {
+      format: "orbit-foundry",
+      version: 1,
+      scenario,
+      t,
+      nextId,
+      selected,
+      follow,
+      paused,
+      rate,
+      settings: { ...settings },
+      ui: {
+        launchFrame: $("launchFrame").value,
+        launchGain: Number($("launchGain").value),
+        curvature: $("curvature").checked,
+        fieldMode: $("fieldMode").value,
+        fieldStrength: Number($("fieldStrength").value),
+        lensing: $("lensing").checked,
+      },
+      camera: { ...cam, scale, yaw, tilt },
+      bodies: bodies.map((b) => ({
+        id: b.id,
+        name: b.name,
+        planet: b.planet || null,
+        kind: b.kind,
+        mass: b.mass,
+        r: b.r,
+        x: b.x,
+        y: b.y,
+        z: b.z,
+        vx: b.vx,
+        vy: b.vy,
+        vz: b.vz,
+        color: b.color,
+        ring: !!b.ring,
+        tidalDone: !!b.tidalDone,
+      })),
+    };
+  }
+  function blobDownload(blob, name) {
+    let a = document.createElement("a"),
+      u = URL.createObjectURL(blob);
+    a.href = u;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(u), 5000);
+  }
+  $("exportBtn").onclick = () => {
+    blobDownload(
+      new Blob([JSON.stringify(payload(), null, 2)], {
+        type: "application/json",
+      }),
+      "orbit-foundry-" + new Date().toISOString().slice(0, 10) + ".json",
+    );
+    notify("JSON экспортирован");
+  };
+  $("saveBtn").onclick = () => {
+    try {
+      localStorage.setItem("orbit-foundry-v1", JSON.stringify(payload()));
+      notify("Система сохранена в этом браузере");
+    } catch (e) {
+      notify("Браузер не разрешил сохранение. Используйте экспорт JSON.");
+    }
+  };
+  function restore(data) {
+    if (
+      !data ||
+      data.format !== "orbit-foundry" ||
+      data.version !== 1 ||
+      !Array.isArray(data.bodies) ||
+      data.bodies.length > MAX
+    )
+      throw Error("Неверный формат или превышен лимит тел.");
+    let ids = new Set(),
+      loaded = [];
+    for (let o of data.bodies) {
+      if (!Number.isInteger(o.id) || o.id < 1 || ids.has(o.id))
+        throw Error("Неверные ID тел.");
+      ids.add(o.id);
+      for (let key of ["x", "y", "z", "vx", "vy", "vz", "mass", "r"])
+        if (
+          typeof o[key] !== "number" ||
+          !Number.isFinite(o[key]) ||
+          Math.abs(o[key]) > 1e12
+        )
+          throw Error("Некорректные числовые данные.");
+      if (
+        o.mass < 1e-14 ||
+        o.mass > 1e9 ||
+        o.r <= 0 ||
+        !Object.keys(kinds).includes(o.kind)
+      )
+        throw Error("Недопустимые параметры тела.");
+      loaded.push({
+        id: o.id,
+        planet: ["sun","mercury","venus","earth","mars","jupiter","saturn","uranus","neptune"].includes(o.planet)?o.planet:null,
+        name: String(o.name || "Тело").slice(0, 36),
+        kind: o.kind,
+        mass: o.mass,
+        r: o.kind === "bh" ? (2 * G * o.mass) / C ** 2 : o.r,
+        x: o.x,
+        y: o.y,
+        z: o.z,
+        vx: o.vx,
+        vy: o.vy,
+        vz: o.vz,
+        color: /^#[0-9a-f]{6}$/i.test(o.color) ? o.color : "#a9c9e9",
+        ring: !!o.ring,
+        tidalDone: !!o.tidalDone,
+        trail: [],
+        ax: 0,
+        ay: 0,
+        az: 0,
+      });
+    }
+    let s = data.settings || {},
+      c = data.camera || {};
+    if (
+      !Number.isFinite(data.t) ||
+      data.t < 0 ||
+      data.t > 1e12 ||
+      !Number.isFinite(data.rate) ||
+      data.rate < 1e-6 ||
+      data.rate > 100
+    )
+      throw Error("Некорректное время.");
+    for (let key of ["x", "y", "z", "scale", "yaw", "tilt"])
+      if (
+        typeof c[key] !== "number" ||
+        !Number.isFinite(c[key]) ||
+        Math.abs(c[key]) > 1e12
+      )
+        throw Error("Некорректная камера.");
+    if (c.scale < 0.00001 || c.scale > 1e10 || c.tilt < 0 || c.tilt > Math.PI - .025)
+      throw Error("Недопустимый масштаб камеры.");
+    if (
+      !["merge", "bounce", "fragment", "none"].includes(s.collision) ||
+      ![0.015, 0.035, 0.07].includes(s.accuracy) ||
+      !Number.isFinite(s.soft) ||
+      s.soft < 1e-10 ||
+      s.soft > 1
+    )
+      throw Error("Некорректные настройки физики.");
+    let u = data.ui || {};
+    $("launchFrame").value =
+      u.launchFrame === "relative" ? "relative" : "world";
+    $("launchGain").value =
+      Number.isFinite(u.launchGain) &&
+      u.launchGain >= 0.001 &&
+      u.launchGain <= 100000
+        ? u.launchGain
+        : 10;
+    $("curvature").checked = u.curvature !== false;
+    $("fieldMode").value =
+      u.fieldMode === "schwarzschild" ? "schwarzschild" : "potential";
+    $("fieldStrength").value =
+      Number.isFinite(u.fieldStrength) &&
+      u.fieldStrength >= 0.5 &&
+      u.fieldStrength <= 4
+        ? u.fieldStrength
+        : 2;
+    $("lensing").checked = u.lensing !== false;
+    updateFieldUI();
+    orbitAnchor = null;
+    bodies = loaded;
+    nextId = Math.max(0, ...loaded.map((b) => b.id)) + 1;
+    t = data.t;
+    settings = {
+      collision: s.collision,
+      accuracy: s.accuracy,
+      soft: s.soft,
+      tides: !!s.tides,
+      rel: !!s.rel,
+    };
+    selected = ids.has(data.selected) ? data.selected : null;
+    follow = ids.has(data.follow) ? data.follow : null;
+    paused = true;
+    cam = { x: c.x, y: c.y, z: c.z };
+    scale = targetScale = c.scale;
+    yaw = c.yaw;
+    tilt = c.tilt;
+    scenario = "solar";
+    cameraFlight=null;
+    $("scenarioTitle").textContent = "Своя вселенная";
+    $("scenarioDesc").textContent =
+      "Система восстановлена из сохранения. Время приостановлено.";
+    document
+      .querySelectorAll("[data-scene]")
+      .forEach((b) => b.classList.remove("active"));
+    $("timeRate").value = Math.log10(data.rate);
+    setRate();
+    $("collision").value = settings.collision;
+    $("accuracy").value = settings.accuracy;
+    $("softening").value = settings.soft;
+    $("tides").checked = settings.tides;
+    $("grRel").checked = settings.rel;
+    events = [];
+    effects = [];
+    pred = [];
+    pointer = null;
+    dirtyList = true;
+    baselineDirty = true;
+    energy0 = null;
+    accel(bodies);
+    syncFields();
+    updatePause();
+    updateStats();
+    uiUpdate();
+    event("Восстановлена система: " + bodies.length + " тел");
+    notify("Система загружена. Нажмите Space для запуска.");
+  }
+  $("restoreBtn").onclick = () => {
+    try {
+      let raw = localStorage.getItem("orbit-foundry-v1");
+      if (!raw) {
+        notify("В этом браузере ещё нет сохранения.");
+        return;
+      }
+      if (confirm("Заменить текущую систему сохранением?"))
+        restore(JSON.parse(raw));
+    } catch (e) {
+      notify("Не удалось загрузить: " + e.message);
+    }
+  };
+  $("importBtn").onclick = () => $("fileInput").click();
+  $("fileInput").onchange = async (e) => {
+    let f = e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    if (f.size > 2e6) {
+      notify("Файл слишком большой: максимум 2 МБ.");
+      return;
+    }
+    try {
+      let data = JSON.parse(await f.text());
+      if (confirm("Заменить текущую систему данными из файла?")) restore(data);
+    } catch (err) {
+      notify("Ошибка импорта: " + err.message);
+    }
+  };
+  let helpPrevPaused = false,
+    prevFocus = null;
+  function showHelp() {
+    helpPrevPaused = paused;
+    paused = true;
+    updatePause();
+    prevFocus = document.activeElement;
+    $("help").hidden = false;
+    $("closeHelp").focus();
+  }
+  function closeHelp() {
+    if ($("help").hidden) return;
+    $("help").hidden = true;
+    paused = helpPrevPaused;
+    updatePause();
+    prevFocus?.focus();
+  }
+  $("helpBtn").onclick = showHelp;
+  $("closeHelp").onclick = closeHelp;
+  $("help").onclick = (e) => {
+    if (e.target === $("help")) closeHelp();
+  };
+  function cinema() {
+    document.body.classList.toggle("hidden-ui");
+    if (document.body.classList.contains("hidden-ui"))
+      notify("Кинорежим · Tab — вернуть интерфейс · P — снимок");
+  }
+  $("cinemaBtn").onclick = cinema;
+  function screenshot() {
+    cv.toBlob((b) => {
+      if (b) blobDownload(b, "orbit-foundry.png");
+    });
+    notify("Снимок пространства сохранён в PNG");
+  }
+  addEventListener("keydown", (e) => {
+    let editing = ["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName);
+    if (!$("help").hidden) {
+      if (e.key === "Escape") closeHelp();
+      if (e.key === "Tab") {
+        let nodes = [...$("help").querySelectorAll("button")];
+        if (!nodes.length) return;
+        e.preventDefault();
+        nodes[0].focus();
+      }
+      return;
+    }
+    if (editing) return;
+    if (e.code === "Space") {
+      e.preventDefault();
+      togglePause();
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      cinema();
+    } else if (e.key === "Escape") {
+      setTool("select");
+      document.body.classList.remove("hidden-ui");
+    } else if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      let b = getSelected();
+      if (b) {
+        removeBody(b);
+        syncFields();
+      }
+    } else if (["1", "2", "3", "4"].includes(e.key))
+      setTool(["select", "orbit", "launch", "delete"][+e.key - 1]);
+    else if (e.key.toLowerCase() === "g") $("fieldBtn").click();
+    else if (e.key.toLowerCase() === "f") fit();
+    else if (e.key.toLowerCase() === "c") toggleFollow();
+    else if (e.key.toLowerCase() === "h" || e.key === "?") showHelp();
+    else if (e.key.toLowerCase() === "p") screenshot();
+    else if (e.key === ".") $("stepBtn").click();
+  });
+  function sampleTrails() {
+    for (let b of bodies) {
+      let last = b.trail[b.trail.length - 1];
+      if (
+        !last ||
+        Math.hypot(b.x - last.x, b.y - last.y, b.z - last.z) * scale > 0.7
+      ) {
+        b.trail.push({ x: b.x, y: b.y, z: b.z });
+        if (b.trail.length > 650) b.trail.shift();
+      }
+    }
+  }
+  let last = performance.now(),
+    uiLast = 0,
+    trailLast = 0,
+    fpsAcc = 0,
+    frames = 0;
+  function frame(now) {
+    let wallDt = Math.min((now - last) / 1000, .2), dt = Math.min(wallDt, 0.05);
+    last = now;
+    fpsAcc += dt;
+    frames++;
+    if (fpsAcc > 0.6) {
+      lastFPS = frames / fpsAcc;
+      fpsAcc = 0;
+      frames = 0;
+    }
+    if (!paused) simulate(dt * rate);
+    if (now - trailLast > 35 && !paused) {
+      sampleTrails();
+      trailLast = now;
+    }
+    if(cameraFlight){
+      const f=cameraFlight,b=bodies.find(b=>b.id===f.id);
+      if(!b){cameraFlight=null;}else{
+        const u=Math.min(1,(now-f.start)/f.duration),e=u*u*(3-2*u);
+        cam.x=f.cam.x+(b.x-f.cam.x)*e;cam.y=f.cam.y+(b.y-f.cam.y)*e;cam.z=f.cam.z+(b.z-f.cam.z)*e;
+        scale=targetScale=Math.exp(Math.log(f.scale)+(Math.log(f.endScale)-Math.log(f.scale))*e);
+        yaw=f.yaw+(f.endYaw-f.yaw)*e;tilt=f.tilt+(1.04-f.tilt)*e;
+        if(u===1)cameraFlight=null;
+      }
+    }else{targetScale=Math.min(targetScale,maxZoom());scale=Math.exp(Math.log(scale)+(Math.log(targetScale)-Math.log(scale))*(1-Math.exp(-wallDt*13)));}
+    let tracked = bodies.find((b) => b.id === follow);
+    if (tracked && !cameraFlight && !(pointer && pointer.wasPaused !== undefined)) {
+      let k = 1 - Math.exp(-dt * 12);
+      cam.x = tracked.x;
+      cam.y = tracked.y;
+      cam.z = tracked.z;
+    }
+    draw(now, wallDt);
+    if (now - uiLast > 200) {
+      updateStats();
+      uiUpdate();
+      uiLast = now;
+    }
+    if (!pointer && now - lastPred > 1800) {
+      predict();
+      lastPred = now;
+    }
+    requestAnimationFrame(frame);
+  }
+  // Compact, deterministic hooks for reproducible offline QA; not used by the UI.
+  window.OrbitFoundry = {
+    getView: () => ({ cam: { ...cam }, scale, yaw, tilt, W, H }),
+    focusShowcase: focusPlanet,
+    zoomBy,
+    get selected(){return selected;},
+    get following(){return follow;},
+    get cameraFlying(){return !!cameraFlight;},
+    get bodies() {
+      return bodies;
+    },
+    get stats() {
+      updateStats();
+      return stats;
+    },
+    get time() {
+      return t;
+    },
+    get paused() {
+      return paused;
+    },
+    loadScene: (s) => loadScene(s, false),
+    simulate,
+    spawn,
+    unproject,
+    flammHeight,
+    launchVelocity,
+    initialLaunchVelocity,
+    candidate,
+    previewLaunch,
+    safeStep,
+    leap,
+    accel,
+    cancelPointer,
+    get launchPath() {
+      return launchPath;
+    },
+    get pointer() {
+      return pointer;
+    },
+    get settings() {
+      return settings;
+    },
+    payload,
+    restore,
+    pause: () => {
+      paused = true;
+      updatePause();
+    },
+    select: (id) => select(bodies.find((b) => b.id === id)),
+    fit,
+    project,
+    get G() {
+      return G;
+    },
+    get energy() {
+      updateStats();
+      return stats.E;
+    },
+  };
+  addEventListener("resize",()=>{if(follow)focusPlanet(true)});
+  loadScene("solar", false);
+  paused = true;
+  updatePause();
+  requestAnimationFrame(frame);
 })();
