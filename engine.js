@@ -2224,7 +2224,7 @@
     let sun=bodies.find(q=>q.kind==='star'&&q.id!==b.id), angle=sun?Math.atan2(sun.x-b.x,sun.y-b.y)-.32:0.15;
     angle=yaw+Math.atan2(Math.sin(angle-yaw),Math.cos(angle-yaw));
     let availableW=Math.max(240,W-(W<1250?530:610)),availableH=Math.max(220,H-390);
-    let ring=b.ring?1.85:1.08,endScale=Math.min(availableW*.40,availableH*.36)/(b.r*ring*Math.max(.4,Number($("sizeScale").value)));
+    let ring=(b.ring||b.planet==="uranus")?1.85:1.08,endScale=Math.min(availableW*.40,availableH*.36)/(b.r*ring*Math.max(.4,Number($("sizeScale").value)));
     const switching=follow!==b.id;follow=b.id;
     if(switching&&!immediate){cam={x:b.x,y:b.y,z:b.z};scale=targetScale=endScale*.58;}
     if(immediate){cam={x:b.x,y:b.y,z:b.z};scale=targetScale=endScale;yaw=angle;tilt=1.04;cameraFlight=null;}
