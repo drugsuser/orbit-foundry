@@ -85,7 +85,7 @@
     pred = [],
     lastPred = 0,
     baselineDirty = true;
-  let lastImpact = null, impactSerial = 0, impactWatch = null;
+  let lastImpact = null, impactSerial = 0, impactWatch = null, contactPairs=new Map(), surfaceInspection=null;
   let orbitAnchor = null;
   let launchPath = [],
     launchPathTime = 0,
@@ -403,7 +403,7 @@
     t = 0;
     events = [];
     effects = [];
-    lastImpact=null;impactWatch=null;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
+    lastImpact=null;impactWatch=null;contactPairs.clear();surfaceInspection=null;$('surfaceBack').hidden=true;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
     pred = [];
     energy0 = null;
     settings.rel = key === "blackhole";
@@ -449,7 +449,7 @@
           y = b.y - a.y,
           z = b.z - a.z,
           r2 = x * x + y * y + z * z + eps2,
-          inv = G / (r2 * Math.sqrt(r2)),
+          inv = G / Math.pow(Math.max(r2,.25*(a.r+b.r)**2),1.5),
           cor = 1;
         if (settings.rel && (a.kind === "bh" || b.kind === "bh")) {
           let vx = b.vx - a.vx,
@@ -477,15 +477,17 @@
     for (let i = 0; i < arr.length; i++) {
       let a = arr[i];
       for (let j = i + 1; j < arr.length; j++) {
-        let b = arr[j],
-          r2 = (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2,
+        let b = arr[j];
+        if(a.phase==='dust'||b.phase==='dust')continue;
+        let r2 = (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2,
           r = Math.sqrt(r2),
           v = Math.hypot(a.vx - b.vx, a.vy - b.vy, a.vz - b.vz);
         let dynam =
           settings.accuracy *
-          Math.sqrt(Math.pow(r2 + e, 1.5) / (G * (a.mass + b.mass)));
+          Math.sqrt(Math.pow(Math.max(r2 + e,.25*(a.r+b.r)**2), 1.5) / (G * (a.mass + b.mass)));
         if (dynam < dt) dt = dynam;
         let crossing = (0.12 * Math.max(r, settings.soft)) / (v + 1e-25);
+        if(r<(a.r+b.r)*1.3&&Math.min(a.r,b.r)/Math.max(a.r,b.r)>.04)crossing=Math.min(crossing,.045*Math.min(a.r,b.r)/(v+1e-25));
         if (crossing < dt) dt = crossing;
       }
     }
@@ -510,6 +512,7 @@
     }
   }
   function simulate(wanted) {
+    if(window.FoundryRenderer?.pendingSolids?.())return 0;
     let rem = wanted;
     steps = 0;
     limited = false;
@@ -524,8 +527,9 @@
       leap(dt, bodies);
       t += dt;
       rem -= dt;
-      contacts();
+      contacts(dt);
       steps++;
+      if(window.FoundryRenderer?.pendingSolids?.())break;
       if (impactWatch === "done") {impactWatch=null; break;}
       if (steps % 6 === 0 && performance.now() - start > 15) break;
     }
@@ -633,57 +637,113 @@
   }
   function reportImpact(result) {
     lastImpact={...result,serial:++impactSerial};
-    const labels={crater:'Локальный кратер',erosion:'Выброс вещества',catastrophic:'Глобальное разрушение',atmospheric:'Удар в атмосферу',absorption:'Испарение → поглощение'};
-    const text=labels[result.outcome]||result.outcome;
-    const number=n=>n.toLocaleString('ru-RU',{maximumFractionDigits:2});
+    const labels={crater:'Вмятина в поверхности',shaving:'Срезание · контакт продолжается',pass:'Тела разошлись после срезания',eroded:'Вещество разрушено в зоне контакта',atmospheric:'Газовый контакт',absorption:'Испарение → поглощение'};
     $('impactReport').hidden=false;
-    document.querySelector('[data-tab=body]').click();document.querySelector('.right').scrollTop=0;
-    $('impactOutcome').textContent=text;
-    $('impactDetail').textContent=result.target+' · '+number(result.speed)+' км/с · '+result.energy.toExponential(2)+' Дж';
-    $('impactScale').textContent=result.outcome==='absorption'?'Звезда осталась целой · '+Math.round(result.temperature).toLocaleString('ru-RU')+' K':
-      'Крупнейший остаток: '+number(result.retained*100)+'% массы · Q/Q*: '+result.severity.toExponential(2)+(result.outcome==='catastrophic'?' · разрушение всей цели':result.craterRadius>0?' · кратер ≈ '+number(result.craterRadius*2)+' км':' · газовый выброс');
-    $('impactHint').textContent=result.outcome==='absorption'?'Горячая звёздная плазма поглощает ударник. Каменных обломков звезды нет.':result.outcome==='crater'&&result.craterAngle<.003?'След физически мал: в масштабе планеты он может быть меньше пикселя.': 'Размер следа физический. Обломки — ограниченные по числу пакеты вещества, не отдельные камни.';
-    if(impactWatch && (result.targetId===impactWatch || result.projectileId===impactWatch)) {paused=true;impactWatch='done';updatePause();}
-    event(text+': '+result.target);
+    document.querySelector('[data-tab=body]').click();
+    const num=n=>n.toLocaleString('ru-RU',{maximumFractionDigits:2});
+    $('impactOutcome').textContent=labels[result.outcome]||result.outcome;
+    $('impactDetail').textContent=result.target+' · '+num(result.speed)+' км/с';
+    $('impactScale').textContent=result.outcome==='absorption'?'Звезда осталась целой · '+Math.round(result.temperature).toLocaleString('ru-RU')+' K':result.outcome==='crater'?
+      'Диаметр '+num(result.craterRadius*2)+' км · глубина '+num(result.craterDepth)+' км':
+      'В уцелевших телах: '+num(result.retained*100)+'% · в выбросе: '+num((1-result.retained)*100)+'%';
+    $('impactHint').textContent=result.outcome==='absorption'?'Горячая плазма поглощает ударник.':result.outcome==='crater'?'Это углубление сетки, а не пятно. На масштабе всей планеты малый кратер почти не виден.':
+      'Удаляется только пересекающееся вещество. Уцелевшие части продолжают движение; срезанная масса уходит в облака выброса.';
+    $('inspectImpact').hidden=!result.craterBody;
+    if(!result.inProgress&&impactWatch && (result.targetId===impactWatch || result.projectileId===impactWatch)) {paused=true;impactWatch='done';updatePause();}
+    if(!result.inProgress)event(labels[result.outcome]+': '+result.target);
   }
-  function resolveImpact(a,b) {
-    const result=ImpactPhysics.analyze(a,b),keep=result.targetId===a.id?a:b,drop=keep===a?b:a;
-    const targetName=keep.name,normal=result.normal,local=window.FoundryRenderer?.localImpactNormal?.(keep.id,normal)||normal;
-    const generated=ImpactPhysics.fragments(a,b,result,Math.min(12,MAX-bodies.length));
-    const savedScars=keep.scars||[],catastrophic=result.severity>=1;
-    if(selected===drop.id)selected=keep.id;if(follow===drop.id)follow=keep.id;
-    removeBody(drop,true);
-    const parts=generated.parts;
-    const primary=parts[0]||{...generated.center,mass:a.mass+b.mass,r:generated.R};
-    Object.assign(keep,{mass:primary.mass,r:primary.r,x:primary.x,y:primary.y,z:primary.z,vx:primary.vx,vy:primary.vy,vz:primary.vz,trail:[],previous:null});
-    if(catastrophic){keep.kind='debris';keep.phase=result.gas?'gas':'rock';keep.planet=null;keep.ring=false;keep.name='Остаток · '+targetName;keep.scars=[];keep.color=result.gas?keep.color:'#8b7969';keep.hot=true;}
-    else if(!result.gas){keep.scars=[...savedScars,{normal:local,angle:result.craterAngle,heat:Math.min(1,result.severity*30+.15)}].slice(-8);}
-    for(const p of parts.slice(1))body({...p,name:(result.gas?'Газ':'Обломок')+' · '+targetName,kind:'debris',phase:result.gas?'gas':'rock',color:result.gas?keep.color:'#8b7969',hot:true,planet:null,tidalDone:true});
-    window.FoundryRenderer?.impact?.(keep,normal,Math.max(result.craterAngle,catastrophic?.7:.001),false);
-    reportImpact({...result,target:targetName,retained:keep.mass/result.totalMass});syncFields();
+  function depositDust(owner,mass,velocity,point,key,spread) {
+    if(!(mass>1e-30))return;
+    let dust=bodies.find(b=>b.dustKey===key&&b.phase==='dust');
+    if(dust){const total=dust.mass+mass;for(const k of ['x','y','z']){dust[k]=(dust[k]*dust.mass+point[k]*mass)/total;dust['v'+k]=(dust['v'+k]*dust.mass+velocity['v'+k]*mass)/total;}dust.mass=total;dust.r=owner.r*Math.cbrt(total/(owner.solid?.mass0||owner.mass||total));dust.spread=Math.max(dust.spread,spread);}
+    else if(bodies.length<MAX){dust=body({name:'Выброс · '+owner.name,kind:'debris',phase:'dust',mass,r:owner.r*Math.cbrt(mass/(owner.solid?.mass0||owner.mass||mass)),...point,...velocity,color:'#a8957f',dustKey:key,spread,born:t,tidalDone:true});}
+    else{owner.mass+=mass;if(owner.solid)owner.solid.extraLoss-=mass;notify('Лимит тел: выброшенное вещество осталось неразрешённым в массе цели.');}
+    return dust;
   }
+  function excavate(target,projectile,analysis) {
+    const before=target.mass,oldP={x:before*target.vx+projectile.mass*projectile.vx,y:before*target.vy+projectile.mass*projectile.vy,z:before*target.vz+projectile.mass*projectile.vz};
+    target.solidLock=true;
+    const result=SolidPhysics.crater(target,projectile,analysis),dustMass=result.removed+projectile.mass,total=before+projectile.mass,n=analysis.normal;
+    const vrel=analysis.speed/VUNIT,eject=Math.min(vrel*.4,Math.sqrt(.10*projectile.mass/Math.max(dustMass,1e-30))*vrel),velocity={};
+    for(const k of ['x','y','z']){velocity['v'+k]=oldP[k]/total+n[k]*eject;target['v'+k]=(oldP[k]-velocity['v'+k]*dustMass)/Math.max(1e-30,target.mass);}
+    const point=SolidPhysics.world(target,result.normal),projectileId=projectile.id;
+    if(selected===projectileId)selected=target.id;if(follow===projectileId)follow=target.id;removeBody(projectile,true);
+    depositDust(target,dustMass,velocity,point,'impact-'+projectileId,eject*.65);
+    target.solid.revision++;window.FoundryRenderer?.sculpt?.(target);
+    window.FoundryRenderer?.impact?.(target,n,analysis.craterAngle,false);
+    reportImpact({...analysis,...result,target:target.name,outcome:'crater',targetId:target.id,projectileId,craterBody:target.id,craterNormal:result.normal,craterDepth:result.craterDepth,retained:target.mass/total});
+    syncFields();
+  }
+  function materialContact(a,b,dt) {
+    const min=Math.min(a.r,b.r),max=Math.max(a.r,b.r),key=[a.id,b.id].sort((x,y)=>x-y).join(':');
+    let pair=contactPairs.get(key),analysis;
+    if(min/max<.055&&!pair){analysis=ImpactPhysics.analyze(a,b);const target=analysis.targetId===a.id?a:b,projectile=target===a?b:a;
+      // A surviving-material query prevents impacts against an already empty crater.
+      const entry={x:target.x+analysis.normal.x*target.r*.99999,y:target.y+analysis.normal.y*target.r*.99999,z:target.z+analysis.normal.z*target.r*.99999};
+      if(target.solid&&!SolidPhysics.contains(target,entry))return false;
+      excavate(target,projectile,analysis);return true;
+    }
+    const contact=SolidPhysics.overlap(a,b);if(!contact)return false;
+    if(!pair){analysis=ImpactPhysics.analyze(a,b);const rel={x:b.vx-a.vx,y:b.vy-a.vy,z:b.vz-a.vz},dr={x:b.x-a.x,y:b.y-a.y,z:b.z-a.z};
+      pair={a:a.id,b:b.id,initialA:a.mass,initialB:b.mass,total:a.mass+b.mass,speed:analysis.speed,energy:analysis.energy,target:a.name+' / '+b.name,lastA:null,lastB:null,offset:Math.sqrt(Math.max(0,1-analysis.incidence**2)),started:t};contactPairs.set(key,pair);
+    }
+    a.solidLock=b.solidLock=true;
+    if(pair.lastA&&Math.hypot(a.x-b.x-pair.lastA.x,a.y-b.y-pair.lastA.y,a.z-b.z-pair.lastA.z)<min*.035)return false;
+    const va={vx:a.vx,vy:a.vy,vz:a.vz},vb={vx:b.vx,vy:b.vy,vz:b.vz},result=SolidPhysics.shave(a,b,contact);
+    pair.lastA={x:a.x-b.x,y:a.y-b.y,z:a.z-b.z};
+    if(!result.changed)return false;
+    const spread=pair.speed/VUNIT*.12;
+    depositDust(a,result.a,va,contact.point,'cut-'+key+'-a',spread);depositDust(b,result.b,vb,contact.point,'cut-'+key+'-b',spread);
+    for(const body of [a,b]){if(body.solid&&body.mass<body.solid.mass0*.003){depositDust(body,body.mass,{vx:body.vx,vy:body.vy,vz:body.vz},contact.point,'cut-'+key+'-'+(body===a?'a':'b'),spread);removeBody(body,true);}else window.FoundryRenderer?.sculpt?.(body);}
+    pair.remaining=(bodies.includes(a)?a.mass:0)+(bodies.includes(b)?b.mass:0);
+    reportImpact({targetId:a.id,projectileId:b.id,target:pair.target,speed:pair.speed,energy:pair.energy,retained:pair.remaining/pair.total,outcome:'shaving',inProgress:true});
+    baselineDirty=true;return true;
+  }
+  function finishContacts() {
+    for(const [key,p]of contactPairs){const a=bodies.find(b=>b.id===p.a),b=bodies.find(b=>b.id===p.b);if(a&&b&&Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z)<(a.r+b.r)*1.025)continue;
+      const remaining=(a?.mass||0)+(b?.mass||0);reportImpact({targetId:p.a,projectileId:p.b,target:p.target,speed:p.speed,energy:p.energy,retained:remaining/p.total,outcome:a&&b?'pass':'eroded'});contactPairs.delete(key);
+    }
+  }
+  function inspectImpact() {
+    if(!lastImpact?.craterBody)return;const b=bodies.find(b=>b.id===lastImpact.craterBody);if(!b)return;
+    paused=true;updatePause();b.solidLock=true;
+    const n=lastImpact.craterNormal,world=SolidPhysics.rotate(n,b.solidQuaternion),angle=Math.max(.00001,lastImpact.angle||lastImpact.craterAngle);
+    const distance=b.r*angle*7,viewN=world,point=SolidPhysics.world(b,n);
+    // Oblique surface view shows the floor and wall, not just the circular footprint.
+    let tangent={x:-viewN.y,y:viewN.x,z:0},len=Math.hypot(tangent.x,tangent.y)||1;for(const k of ['x','y','z'])tangent[k]/=len;
+    const look={x:viewN.x*.56+tangent.x*.83,y:viewN.y*.56+tangent.y*.83,z:viewN.z*.56+tangent.z*.83},L=Math.hypot(look.x,look.y,look.z);
+    yaw=Math.atan2(look.x,look.y);tilt=Math.acos(look.z/L);follow=null;cameraFlight=null;
+    cam={x:point.x-world.x*b.r*(lastImpact.depth||.0001)*.4,y:point.y-world.y*b.r*(lastImpact.depth||.0001)*.4,z:point.z-world.z*b.r*(lastImpact.depth||.0001)*.4};
+    scale=targetScale=H/(2*Math.tan(21*Math.PI/180)*distance);surfaceInspection={body:b.id};
+    $('surfaceBack').hidden=false;notify('Рельеф без текстур · реальные стенки и дно кратера.');
+  }
+  $('inspectImpact').onclick=inspectImpact;
+  $('surfaceBack').onclick=()=>{surfaceInspection=null;$('surfaceBack').hidden=true;if(lastImpact?.craterBody)select(bodies.find(b=>b.id===lastImpact.craterBody));focusPlanet(true);};
   function launchImpact() {
     const target=getSelected();if(!target){notify('Сначала выберите цель в списке планет.');return;}
     if(bodies.length>=MAX){notify('Лимит тел: удалите несколько обломков.');return;}
     const kg=Number($('impactMass').value),radius=Number($('impactRadius').value),speed=Number($('impactSpeed').value);
     if(!Number.isFinite(kg)||kg<1e6||kg>1e31||!Number.isFinite(radius)||radius<.001||radius>1e7||!Number.isFinite(speed)||speed<.1||speed>3000){notify('Проверьте массу, радиус и скорость ударника.');return;}
-    const st=Math.sin(tilt),normal={x:Math.sin(yaw)*st,y:Math.cos(yaw)*st,z:Math.cos(tilt)},r=radius/AU,distance=target.r*3+r*3;
-    const projectile=body({name:'Ударник '+nextId,kind:'asteroid',mass:kg/MS,r,x:target.x+normal.x*distance,y:target.y+normal.y*distance,z:target.z+normal.z*distance,vx:target.vx-normal.x*speed/VUNIT,vy:target.vy-normal.y*speed/VUNIT,vz:target.vz-normal.z*speed/VUNIT,color:'#b7a18d'});
+    surfaceInspection=null;$('surfaceBack').hidden=true;
+    const st=Math.sin(tilt),normal={x:Math.sin(yaw)*st,y:Math.cos(yaw)*st,z:Math.cos(tilt)},side={x:Math.cos(yaw),y:-Math.sin(yaw),z:0},r=radius/AU,distance=(target.r+r)*3.6,offset=Number($('impactOffset').value)*(target.r+r);
+    const projectile=body({name:'Ударник '+nextId,kind:'asteroid',mass:kg/MS,r,x:target.x-side.x*distance+normal.x*offset,y:target.y-side.y*distance+normal.y*offset,z:target.z-side.z*distance+normal.z*offset,vx:target.vx+side.x*speed/VUNIT,vy:target.vy+side.y*speed/VUNIT,vz:target.vz+side.z*speed/VUNIT,color:'#b7a18d'});
     settings.collision='fragment';$('collision').value='fragment';
     impactWatch=$('impactAutoPause').checked?target.id:null;
     rate=Math.max(1e-6,Math.min(100,(distance-target.r-r)/(speed/VUNIT)/6));
     $('timeRate').value=Math.log10(rate);setRate();paused=false;updatePause();
-    dirtyList=true;baselineDirty=true;notify('Ударник запущен. Скорость у поверхности изменится из-за гравитации.');return projectile;
+    if(r/target.r>.055){targetScale*=.48;scale=targetScale;}
+    dirtyList=true;baselineDirty=true;notify('Ударник запущен сбоку. Параметр b задаёт касательный или лобовой контакт.');return projectile;
   }
   $('impactLaunch').onclick=launchImpact;
-  $('impactPreset').onchange=()=>{const presets={small:[1.26e13,1,20],large:[1.26e19,100,25],planet:[5.972e24,6371,50]};const p=presets[$('impactPreset').value];$('impactMass').value=p[0];$('impactRadius').value=p[1];$('impactSpeed').value=p[2];};
-  function contacts() {
+  $('impactPreset').onchange=()=>{const presets={small:[1.26e13,1,20],large:[3.39e20,300,25],planet:[5.972e24,6371,50]};const p=presets[$('impactPreset').value];$('impactMass').value=p[0];$('impactRadius').value=p[1];$('impactSpeed').value=p[2];};
+  function contacts(dt=0) {
     let did = false;
     outer: for (let i = 0; i < bodies.length; i++) {
       let a = bodies[i];
       for (let j = i + 1; j < bodies.length; j++) {
-        let b = bodies[j],
-          dx = b.x - a.x,
+        let b = bodies[j];
+        if(a.phase==='dust'||b.phase==='dust')continue;
+        let dx = b.x - a.x,
           dy = b.y - a.y,
           dz = b.z - a.z,
           r = Math.hypot(dx, dy, dz);
@@ -711,7 +771,8 @@
               (2 * G * (a.mass + b.mass)) / Math.max(a.r + b.r, settings.soft),
             );
           if (settings.collision === "fragment") {
-            resolveImpact(a,b); did=true; break outer;
+            if(materialContact(a,b,dt)){did=true;break outer;}
+            continue;
           }
           if (rel < 0) {
             let impulse = (-2 * rel) / (1 / a.mass + 1 / b.mass);
@@ -758,6 +819,7 @@
         }
       }
     }
+    finishContacts();
     if (did) {
       accel(bodies);
       dirtyList = true;
@@ -1481,7 +1543,7 @@
         }
       }
       if (
-        $("labels").checked &&
+        !surfaceInspection && $("labels").checked &&
         ((b.kind !== "debris" && b.kind !== "asteroid") ||
           b.id === selected ||
           b === hover)
@@ -2253,6 +2315,7 @@
   cv.addEventListener("wheel",e=>{e.preventDefault();zoomBy(Math.exp(-Math.max(-500,Math.min(500,e.deltaY*(e.deltaMode===1?16:1)))*.0022));},{passive:false});
   cv.addEventListener("dblclick",e=>{let b=pick(e.clientX,e.clientY);if(b){select(b);focusPlanet();}});
   function focusPlanet(immediate=false){
+    surfaceInspection=null;$("surfaceBack").hidden=true;
     immediate=immediate||matchMedia("(prefers-reduced-motion: reduce)").matches;
     let b=getSelected()||bodies.find(b=>b.planet==='earth')||bodies[0];if(!b)return;
     let sun=bodies.find(q=>q.kind==='star'&&q.id!==b.id), angle=sun?Math.atan2(sun.x-b.x,sun.y-b.y)-.32:0.15;
@@ -2557,7 +2620,7 @@
         fieldStrength: Number($("fieldStrength").value),
         lensing: $("lensing").checked,
       },
-      camera: { ...cam, scale, yaw, tilt },
+      camera: surfaceInspection&&getSelected()?{x:getSelected().x,y:getSelected().y,z:getSelected().z,scale:H*.205/getSelected().r,yaw:.52,tilt:.78}:{ ...cam, scale, yaw, tilt },
       bodies: bodies.map((b) => ({
         id: b.id,
         name: b.name,
@@ -2574,7 +2637,7 @@
         color: b.color,
         ring: !!b.ring,
         tidalDone: !!b.tidalDone,
-        phase:b.phase||null,scars:b.scars||[],hot:!!b.hot,
+        phase:b.phase||null,scars:b.scars||[],hot:!!b.hot,solid:b.solid||null,solidQuaternion:b.solidQuaternion||null,solidSpin:b.solidSpin||0,solidLock:!!b.solidLock,spread:b.spread||0,born:b.born||0,
       })),
     };
   }
@@ -2648,7 +2711,7 @@
         color: /^#[0-9a-f]{6}$/i.test(o.color) ? o.color : "#a9c9e9",
         ring: !!o.ring,
         tidalDone: !!o.tidalDone,
-        phase:o.phase==='gas'?'gas':null,hot:!!o.hot,
+        phase:['gas','dust'].includes(o.phase)?o.phase:null,hot:!!o.hot,solid:SolidPhysics.valid(o.solid),solidQuaternion:Array.isArray(o.solidQuaternion)&&o.solidQuaternion.length===4&&o.solidQuaternion.every(Number.isFinite)?o.solidQuaternion:null,solidSpin:Number.isFinite(o.solidSpin)?o.solidSpin:0,solidLock:!!o.solidLock,spread:Number.isFinite(o.spread)?Math.max(0,Math.min(1e6,o.spread)):0,born:Number.isFinite(o.born)?o.born:0,
         scars:(Array.isArray(o.scars)?o.scars:[]).slice(-8).filter(s=>Number.isFinite(s.angle)&&s.angle>0&&s.normal&&['x','y','z'].every(k=>Number.isFinite(s.normal[k]))).map(s=>({angle:Math.min(.6,s.angle),normal:s.normal,heat:0})),
         trail: [],
         ax: 0,
@@ -2739,7 +2802,7 @@
     $("grRel").checked = settings.rel;
     events = [];
     effects = [];
-    lastImpact=null;impactWatch=null;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
+    lastImpact=null;impactWatch=null;contactPairs.clear();surfaceInspection=null;$('surfaceBack').hidden=true;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
     pred = [];
     pointer = null;
     dirtyList = true;
@@ -2922,6 +2985,9 @@
     zoomBy,
     get selected(){return selected;},
     get following(){return follow;},
+    get surfaceInspection(){return surfaceInspection;},
+    inspectImpact,
+    get contactPairs(){return contactPairs;},
     get cameraFlying(){return !!cameraFlight;},
     get bodies() {
       return bodies;

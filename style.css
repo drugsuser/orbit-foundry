@@ -14,3 +14,5 @@
 
 .impact-lab .check{display:flex;align-items:center;gap:8px}.impact-lab .check input{width:14px;min-width:14px;margin:0}.impact-lab .check label{flex:1}
 .impact-report{position:relative;left:auto;top:auto;width:auto;margin:16px 16px 0;padding:14px 12px 10px;border-color:#463d30;box-shadow:none}.impact-report .eyebrow{max-width:180px;line-height:1.5}.impact-report p{font-size:11px}.impact-report strong{font-size:16px;padding-right:12px}.impact-report>button{top:3px;right:2px}.impact-report .physics-note{font-size:10px}
+
+.impact-report>button.inspect-impact{position:static;width:100%;margin:6px 0;padding:8px;border:1px solid #61533b;border-radius:4px;color:#e2d2b3;font-size:12px;background:#242016}.inspect-impact[hidden],#surfaceBack[hidden]{display:none}#surfaceBack{position:absolute;left:calc(50% - 80px);bottom:142px;z-index:7;padding:9px 16px;border:1px solid #6d5c3f;background:#171713;color:#e1d0af;border-radius:5px;font-size:12px}.impact-lab output{color:#e5c487;margin-left:5px}
