@@ -50,8 +50,8 @@
     asteroid: {
       name: "Астероид",
       kind: "asteroid",
-      mass: 1e-12,
-      r: 50 / AU,
+      mass: 6.32e-18,
+      r: 1 / AU,
       color: "#a5a2a0",
     },
   };
@@ -85,13 +85,14 @@
     pred = [],
     lastPred = 0,
     baselineDirty = true;
+  let lastImpact = null, impactSerial = 0, impactWatch = null;
   let orbitAnchor = null;
   let launchPath = [],
     launchPathTime = 0,
     launchPathStamp = "",
     fieldSources = [];
   let settings = {
-    collision: "merge",
+    collision: "fragment",
     accuracy: 0.035,
     soft: 1e-6,
     tides: true,
@@ -402,6 +403,7 @@
     t = 0;
     events = [];
     effects = [];
+    lastImpact=null;impactWatch=null;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
     pred = [];
     energy0 = null;
     settings.rel = key === "blackhole";
@@ -495,6 +497,7 @@
       b.vx += b.ax * dt * 0.5;
       b.vy += b.ay * dt * 0.5;
       b.vz += b.az * dt * 0.5;
+      b.previous = {x:b.x,y:b.y,z:b.z};
       b.x += b.vx * dt;
       b.y += b.vy * dt;
       b.z += b.vz * dt;
@@ -523,6 +526,7 @@
       rem -= dt;
       contacts();
       steps++;
+      if (impactWatch === "done") {impactWatch=null; break;}
       if (steps % 6 === 0 && performance.now() - start > 15) break;
     }
     limited = rem > wanted * 0.05;
@@ -542,13 +546,19 @@
   }
   function merge(a, b) {
     let m = a.mass + b.mass,
-      keep = a.mass >= b.mass ? a : b,
+      keep = a.kind === "bh" ? a : b.kind === "bh" ? b : a.kind === "star" ? a : b.kind === "star" ? b : a.mass >= b.mass ? a : b,
       drop = keep === a ? b : a;
     let x = (a.x * a.mass + b.x * b.mass) / m,
       y = (a.y * a.mass + b.y * b.mass) / m,
       z = (a.z * a.mass + b.z * b.mass) / m;
     let bh = a.kind === "bh" || b.kind === "bh";
-    flash(x, y, z, bh ? "#fbc58c" : "#ffe2b2", bh ? 1 : 2);
+    const stellar = keep.kind === "star", oldR=keep.r, oldM=keep.mass;
+    if(stellar){
+      const analysis=ImpactPhysics.analyze(a,b),normal={x:drop.x-keep.x,y:drop.y-keep.y,z:drop.z-keep.z},len=Math.hypot(normal.x,normal.y,normal.z)||1;
+      for(const k of ['x','y','z'])normal[k]/=len;
+      window.FoundryRenderer?.impact?.(keep,normal,.04,true);
+      reportImpact({...analysis,outcome:'absorption',target:keep.name,temperature:temperature(keep),retained:1});
+    } else flash(x, y, z, bh ? "#fbc58c" : "#ffe2b2", bh ? 1 : 2);
     keep.x = x;
     keep.y = y;
     keep.z = z;
@@ -561,11 +571,13 @@
       keep.kind = "bh";
       keep.r = (2 * G * m) / (C * C);
       keep.color = "#eda671";
+    } else if(stellar){
+      keep.r=oldR*Math.cbrt(m/oldM);
     } else {
       keep.name = keep.name + " +";
       keep.trail = [];
     }
-    event((bh ? "Поглощение: " : "Слияние: ") + drop.name + " → " + keep.name);
+    event((stellar ? "Испарение и поглощение: " : bh ? "Поглощение: " : "Слияние: ") + drop.name + " → " + keep.name);
     if (selected === drop.id) selected = keep.id;
     if (follow === drop.id) follow = keep.id;
     removeBody(drop, true);
@@ -619,6 +631,52 @@
     syncFields();
     return true;
   }
+  function reportImpact(result) {
+    lastImpact={...result,serial:++impactSerial};
+    const labels={crater:'Локальный кратер',erosion:'Выброс вещества',catastrophic:'Глобальное разрушение',atmospheric:'Удар в атмосферу',absorption:'Испарение → поглощение'};
+    const text=labels[result.outcome]||result.outcome;
+    const number=n=>n.toLocaleString('ru-RU',{maximumFractionDigits:2});
+    $('impactReport').hidden=false;
+    document.querySelector('[data-tab=body]').click();document.querySelector('.right').scrollTop=0;
+    $('impactOutcome').textContent=text;
+    $('impactDetail').textContent=result.target+' · '+number(result.speed)+' км/с · '+result.energy.toExponential(2)+' Дж';
+    $('impactScale').textContent=result.outcome==='absorption'?'Звезда осталась целой · '+Math.round(result.temperature).toLocaleString('ru-RU')+' K':
+      'Крупнейший остаток: '+number(result.retained*100)+'% массы · Q/Q*: '+result.severity.toExponential(2)+(result.outcome==='catastrophic'?' · разрушение всей цели':result.craterRadius>0?' · кратер ≈ '+number(result.craterRadius*2)+' км':' · газовый выброс');
+    $('impactHint').textContent=result.outcome==='absorption'?'Горячая звёздная плазма поглощает ударник. Каменных обломков звезды нет.':result.outcome==='crater'&&result.craterAngle<.003?'След физически мал: в масштабе планеты он может быть меньше пикселя.': 'Размер следа физический. Обломки — ограниченные по числу пакеты вещества, не отдельные камни.';
+    if(impactWatch && (result.targetId===impactWatch || result.projectileId===impactWatch)) {paused=true;impactWatch='done';updatePause();}
+    event(text+': '+result.target);
+  }
+  function resolveImpact(a,b) {
+    const result=ImpactPhysics.analyze(a,b),keep=result.targetId===a.id?a:b,drop=keep===a?b:a;
+    const targetName=keep.name,normal=result.normal,local=window.FoundryRenderer?.localImpactNormal?.(keep.id,normal)||normal;
+    const generated=ImpactPhysics.fragments(a,b,result,Math.min(12,MAX-bodies.length));
+    const savedScars=keep.scars||[],catastrophic=result.severity>=1;
+    if(selected===drop.id)selected=keep.id;if(follow===drop.id)follow=keep.id;
+    removeBody(drop,true);
+    const parts=generated.parts;
+    const primary=parts[0]||{...generated.center,mass:a.mass+b.mass,r:generated.R};
+    Object.assign(keep,{mass:primary.mass,r:primary.r,x:primary.x,y:primary.y,z:primary.z,vx:primary.vx,vy:primary.vy,vz:primary.vz,trail:[],previous:null});
+    if(catastrophic){keep.kind='debris';keep.phase=result.gas?'gas':'rock';keep.planet=null;keep.ring=false;keep.name='Остаток · '+targetName;keep.scars=[];keep.color=result.gas?keep.color:'#8b7969';keep.hot=true;}
+    else if(!result.gas){keep.scars=[...savedScars,{normal:local,angle:result.craterAngle,heat:Math.min(1,result.severity*30+.15)}].slice(-8);}
+    for(const p of parts.slice(1))body({...p,name:(result.gas?'Газ':'Обломок')+' · '+targetName,kind:'debris',phase:result.gas?'gas':'rock',color:result.gas?keep.color:'#8b7969',hot:true,planet:null,tidalDone:true});
+    window.FoundryRenderer?.impact?.(keep,normal,Math.max(result.craterAngle,catastrophic?.7:.001),false);
+    reportImpact({...result,target:targetName,retained:keep.mass/result.totalMass});syncFields();
+  }
+  function launchImpact() {
+    const target=getSelected();if(!target){notify('Сначала выберите цель в списке планет.');return;}
+    if(bodies.length>=MAX){notify('Лимит тел: удалите несколько обломков.');return;}
+    const kg=Number($('impactMass').value),radius=Number($('impactRadius').value),speed=Number($('impactSpeed').value);
+    if(!Number.isFinite(kg)||kg<1e6||kg>1e31||!Number.isFinite(radius)||radius<.001||radius>1e7||!Number.isFinite(speed)||speed<.1||speed>3000){notify('Проверьте массу, радиус и скорость ударника.');return;}
+    const st=Math.sin(tilt),normal={x:Math.sin(yaw)*st,y:Math.cos(yaw)*st,z:Math.cos(tilt)},r=radius/AU,distance=target.r*3+r*3;
+    const projectile=body({name:'Ударник '+nextId,kind:'asteroid',mass:kg/MS,r,x:target.x+normal.x*distance,y:target.y+normal.y*distance,z:target.z+normal.z*distance,vx:target.vx-normal.x*speed/VUNIT,vy:target.vy-normal.y*speed/VUNIT,vz:target.vz-normal.z*speed/VUNIT,color:'#b7a18d'});
+    settings.collision='fragment';$('collision').value='fragment';
+    impactWatch=$('impactAutoPause').checked?target.id:null;
+    rate=Math.max(1e-6,Math.min(100,(distance-target.r-r)/(speed/VUNIT)/6));
+    $('timeRate').value=Math.log10(rate);setRate();paused=false;updatePause();
+    dirtyList=true;baselineDirty=true;notify('Ударник запущен. Скорость у поверхности изменится из-за гравитации.');return projectile;
+  }
+  $('impactLaunch').onclick=launchImpact;
+  $('impactPreset').onchange=()=>{const presets={small:[1.26e13,1,20],large:[1.26e19,100,25],planet:[5.972e24,6371,50]};const p=presets[$('impactPreset').value];$('impactMass').value=p[0];$('impactRadius').value=p[1];$('impactSpeed').value=p[2];};
   function contacts() {
     let did = false;
     outer: for (let i = 0; i < bodies.length; i++) {
@@ -634,9 +692,9 @@
           ? r <=
             hole.r +
               (a.kind === "bh" && b.kind === "bh" ? Math.min(a.r, b.r) : 0)
-          : r <= a.r + b.r;
-        if (hit && (settings.collision !== "none" || hole)) {
-          if (hole || settings.collision === "merge") {
+          : ImpactPhysics.swept(a,b);
+        if (hit && (settings.collision !== "none" || hole || a.kind === "star" || b.kind === "star")) {
+          if (hole || a.kind === "star" || b.kind === "star" || settings.collision === "merge") {
             merge(a, b);
             did = true;
             break outer;
@@ -652,34 +710,8 @@
             esc = Math.sqrt(
               (2 * G * (a.mass + b.mass)) / Math.max(a.r + b.r, settings.soft),
             );
-          if (
-            settings.collision === "fragment" &&
-            speed > esc * 1.1 &&
-            bodies.length + 12 <= MAX &&
-            a.kind !== "debris" &&
-            b.kind !== "debris"
-          ) {
-            let sum = a.mass + b.mass;
-            let oldV = {
-              x: (a.vx * a.mass + b.vx * b.mass) / sum,
-              y: (a.vy * a.mass + b.vy * b.mass) / sum,
-              z: (a.vz * a.mass + b.vz * b.mass) / sum,
-            };
-            let k = 0.6;
-            for (let q of [a, b]) {
-              q.vx = oldV.x + (q.vx - oldV.x) * k;
-              q.vy = oldV.y + (q.vy - oldV.y) * k;
-              q.vz = oldV.z + (q.vz - oldV.z) * k;
-            }
-            splitBody(a, speed);
-            splitBody(b, speed);
-            did = true;
-            break outer;
-          }
           if (settings.collision === "fragment") {
-            merge(a, b);
-            did = true;
-            break outer;
+            resolveImpact(a,b); did=true; break outer;
           }
           if (rel < 0) {
             let impulse = (-2 * rel) / (1 / a.mass + 1 / b.mass);
@@ -709,6 +741,7 @@
           if (
             !other.tidalDone &&
             other.kind !== "bh" &&
+            other.kind !== "star" &&
             other.kind !== "debris" &&
             other.kind !== "asteroid"
           ) {
@@ -726,6 +759,7 @@
       }
     }
     if (did) {
+      accel(bodies);
       dirtyList = true;
       baselineDirty = true;
       pred = [];
@@ -1948,7 +1982,7 @@
   function candidate(world, velocity) {
     let p = presets[$("preset").value],
       m = Number($("spawnMass").value);
-    if (!Number.isFinite(m) || m < 1e-14 || m > 1e9) return null;
+    if (!Number.isFinite(m) || m < 1e-24 || m > 1e9) return null;
     let r =
       p.kind === "bh" ? (2 * G * m) / C ** 2 : p.r * Math.cbrt(m / p.mass);
     return {
@@ -2040,12 +2074,12 @@
       z = Number($("spawnZ").value);
     if (
       !Number.isFinite(mass) ||
-      mass < 1e-14 ||
+      mass < 1e-24 ||
       mass > 1e9 ||
       !Number.isFinite(z) ||
       Math.abs(z) > 1e8
     ) {
-      notify("Проверьте массу (10⁻¹⁴…10⁹ M☉) и высоту.");
+      notify("Проверьте массу (10⁻²⁴…10⁹ M☉) и высоту.");
       return;
     }
     let c = orb
@@ -2299,7 +2333,7 @@
       vz = Number($("editVz").value) / VUNIT;
     if (
       ![m, r, vx, vy, vz].every(Number.isFinite) ||
-      m < 1e-14 ||
+      m < 1e-30 ||
       m > 1e9 ||
       r <= 0 ||
       r > 1e11 / AU ||
@@ -2540,6 +2574,7 @@
         color: b.color,
         ring: !!b.ring,
         tidalDone: !!b.tidalDone,
+        phase:b.phase||null,scars:b.scars||[],hot:!!b.hot,
       })),
     };
   }
@@ -2591,7 +2626,7 @@
         )
           throw Error("Некорректные числовые данные.");
       if (
-        o.mass < 1e-14 ||
+        o.mass < 1e-24 ||
         o.mass > 1e9 ||
         o.r <= 0 ||
         !Object.keys(kinds).includes(o.kind)
@@ -2613,6 +2648,8 @@
         color: /^#[0-9a-f]{6}$/i.test(o.color) ? o.color : "#a9c9e9",
         ring: !!o.ring,
         tidalDone: !!o.tidalDone,
+        phase:o.phase==='gas'?'gas':null,hot:!!o.hot,
+        scars:(Array.isArray(o.scars)?o.scars:[]).slice(-8).filter(s=>Number.isFinite(s.angle)&&s.angle>0&&s.normal&&['x','y','z'].every(k=>Number.isFinite(s.normal[k]))).map(s=>({angle:Math.min(.6,s.angle),normal:s.normal,heat:0})),
         trail: [],
         ax: 0,
         ay: 0,
@@ -2702,6 +2739,7 @@
     $("grRel").checked = settings.rel;
     events = [];
     effects = [];
+    lastImpact=null;impactWatch=null;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
     pred = [];
     pointer = null;
     dirtyList = true;
@@ -2900,6 +2938,8 @@
     },
     loadScene: (s) => loadScene(s, false),
     simulate,
+    contacts,launchImpact,
+    get lastImpact(){return lastImpact;},
     spawn,
     unproject,
     flammHeight,
