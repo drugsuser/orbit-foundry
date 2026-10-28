@@ -76,6 +76,69 @@
     cam = { x: 0, y: 0, z: 0 },
     targetScale = 100;
   let cameraFlight = null;
+  const navKeys = new Set(), navCodes = new Set(["KeyW","KeyA","KeyS","KeyD","KeyQ","KeyE","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","ShiftLeft","ShiftRight"]);
+  const editingControl = el => !!el && (el.isContentEditable || !!el.closest?.("input,select,textarea,[contenteditable]:not([contenteditable=false])"));
+  function clearNavigation(){navKeys.clear();}
+  function cameraBasis(){
+    const distance=H/(2*Math.tan(21*Math.PI/180)*scale),st=Math.sin(tilt);
+    const forward={x:-Math.sin(yaw)*st,y:-Math.cos(yaw)*st,z:-Math.cos(tilt)};
+    let right=tilt<.0001?{x:1,y:0,z:0}:{x:-Math.cos(yaw),y:Math.sin(yaw),z:0};
+    const up={x:right.y*forward.z,y:-right.x*forward.z,z:right.x*forward.y-right.y*forward.x};
+    const eye={x:cam.x-forward.x*distance,y:cam.y-forward.y*distance,z:cam.z-forward.z*distance};
+    return {distance,forward,right,up,eye};
+  }
+  function rotateCamera(dx,dy){
+    const eye=!follow?cameraBasis().eye:null;
+    if(tilt<.0001)yaw+=Math.PI;
+    yaw+=dx;tilt=Math.max(.025,Math.min(Math.PI-.025,tilt+dy));
+    if(eye){const b=cameraBasis();for(const k of ['x','y','z'])cam[k]=eye[k]+b.forward[k]*b.distance;}
+    $("view3d").classList.add("active");$("viewTop").classList.remove("active");
+  }
+  function navigateCamera(dt){
+    if(!navKeys.size || W<=1000 || document.hidden || !$('help').hidden || editingControl(document.activeElement) || pointer)return;
+    const key=c=>navKeys.has(c)?1:0, strafe=key('KeyD')-key('KeyA'),forward=key('KeyW')-key('KeyS'),rise=key('KeyE')-key('KeyQ');
+    const turn=key('ArrowRight')-key('ArrowLeft'),pitch=key('ArrowDown')-key('ArrowUp');
+    if(!strafe&&!forward&&!rise&&!turn&&!pitch)return;
+    cameraFlight=null;
+    if(turn||pitch)rotateCamera(turn*dt,pitch*dt);
+    if(!strafe&&!forward&&!rise)return;
+    follow=null;surfaceInspection=null;$('surfaceBack').hidden=true;
+    const b=cameraBasis(),delta={},n=Math.hypot(strafe,forward,rise),size=Number($('sizeScale').value);
+    let clearance=b.distance;
+    for(const body of bodies){if(body.kind==='debris')continue;const r=body.r*size;const gap=Math.hypot(b.eye.x-body.x,b.eye.y-body.y,b.eye.z-body.z)-r;if(gap>0)clearance=Math.min(clearance,gap);}
+    const speed=Math.min(b.distance*.65,Math.max(b.distance*.00001,clearance*.8))*(key('ShiftLeft')||key('ShiftRight')?4:1);
+    for(const k of ['x','y','z'])delta[k]=(b.right[k]*strafe+b.forward[k]*forward+b.up[k]*rise)/n*speed*dt;
+    // Swept eye sphere against bodies: no tunnelling through a planet at fast speed.
+    let fraction=1, length=Math.hypot(delta.x,delta.y,delta.z);
+    if(length>0)for(const body of bodies){
+      if(body.kind==='debris')continue;
+      const r=body.r*size*1.015, x=b.eye.x-body.x,y=b.eye.y-body.y,z=b.eye.z-body.z,c=x*x+y*y+z*z-r*r;
+      if(c<=0)continue;const dot=(x*delta.x+y*delta.y+z*delta.z)/length,disc=dot*dot-c;
+      if(dot<0&&disc>=0){const hit=-dot-Math.sqrt(disc);if(hit<length)fraction=Math.min(fraction,Math.max(0,hit/length-.001));}
+    }
+    for(const k of ['x','y','z'])cam[k]+=delta[k]*fraction;
+  }
+  function updateNavigationHUD(){
+    const b=cameraBasis(),tracked=bodies.find(q=>q.id===follow),selectedBody=getSelected();
+    $('navMode').textContent=tracked?'Слежение · '+tracked.name:'Свободный полёт';
+    let nearest=Infinity,hit=null;
+    for(const body of bodies){
+      if(body.kind==='debris')continue;
+      const x=body.x-b.eye.x,y=body.y-b.eye.y,z=body.z-b.eye.z,along=x*b.forward.x+y*b.forward.y+z*b.forward.z;
+      const r=body.r*Number($('sizeScale').value),disc=r*r-(x*x+y*y+z*z-along*along);
+      if(disc<0)continue;const front=along-Math.sqrt(Math.max(0,disc));if(front>=0&&front<nearest){nearest=front;hit=body;}
+    }
+    $('navCenter').textContent='В центре: '+(hit?hit.name:'пустое пространство');
+    const axes=['x','y','z'].sort((a,c)=>Math.abs(b.forward[c])-Math.abs(b.forward[a]));
+    const heading=axes.slice(0,2).filter(k=>Math.abs(b.forward[k])>.15).map(k=>(b.forward[k]>=0?'+':'−')+k.toUpperCase()).join(' / ');
+    $('navHeading').textContent='Взгляд '+heading+' · '+Math.round(Math.asin(Math.max(-1,Math.min(1,b.forward.z)))*180/Math.PI)+'° к XY';
+    const p=selectedBody?project(selectedBody.x,selectedBody.y,selectedBody.z):null,left=W<1250?265:300,right=W<1250?265:310;
+    const visible=p&&!p.behind&&p.x>=left&&p.x<=W-right&&p.y>=260&&p.y<=H-170;
+    $('navReturn').disabled=!selectedBody;$('navReturn').title=selectedBody?'Вернуться к '+selectedBody.name+' — R':'Сначала выберите тело';
+    $('navSelection').textContent=selectedBody&&!tracked?'Выбрано: '+selectedBody.name+(visible?'':' · вне кадра'):'';
+    $('navTop').setAttribute('aria-pressed',tilt<.01?'true':'false');
+    $('navReticle').hidden=!!tracked||!!surfaceInspection;
+  }
   let pointer = null,
     mouse = { x: 0, y: 0 },
     hover = null,
@@ -381,6 +444,7 @@
     },
   };
   function loadScene(key, ask = true) {
+    clearNavigation();
     if (key !== "solar") throw Error("Доступна только Солнечная система.");
     cameraFlight = null;
     if (
@@ -403,7 +467,7 @@
     t = 0;
     events = [];
     effects = [];
-    lastImpact=null;impactWatch=null;contactPairs.clear();surfaceInspection=null;$('surfaceBack').hidden=true;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
+    clearNavigation();lastImpact=null;impactWatch=null;contactPairs.clear();surfaceInspection=null;$('surfaceBack').hidden=true;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
     pred = [];
     energy0 = null;
     settings.rel = key === "blackhole";
@@ -1518,6 +1582,7 @@
       .sort((a, b) => b.p.depth - a.p.depth);
     hover = null;
     for (let { b, p, r } of sorted) {
+      if (p.behind) continue;
       if (p.x < -r * 9 || p.x > W + r * 9 || p.y < -r * 9 || p.y > H + r * 9)
         continue;
       if (!window.FoundryRenderer) drawBody(b, p, r, now);
@@ -1708,29 +1773,13 @@
     }
   }
   function drawCompass() {
-    let x = W - 342,
-      y = H - 153;
-    ctx.font = "10px -apple-system, Segoe UI, sans-serif";
-    let origin = project(cam.x, cam.y, cam.z);
-    for (let a of [
-      { v: [1, 0, 0], c: "#da9b96", s: "X" },
-      { v: [0, 1, 0], c: "#a2c4a0", s: "Y" },
-      { v: [0, 0, 1], c: "#8fb9e4", s: "Z" },
-    ]) {
-      let p = project(
-          cam.x + (a.v[0] / scale) * 27,
-          cam.y + (a.v[1] / scale) * 27,
-          cam.z + (a.v[2] / scale) * 27,
-        ),
-        dx = p.x - origin.x,
-        dy = p.y - origin.y;
-      ctx.strokeStyle = a.c;
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(x + dx, y + dy);
-      ctx.stroke();
-      ctx.fillStyle = a.c;
-      ctx.fillText(a.s, x + dx + 3, y + dy + 3);
+    if(document.body.classList.contains('hidden-ui'))return;
+    const x=W-(W<1250?286:330),y=H-167,b=cameraBasis();
+    ctx.font='12px -apple-system, Segoe UI, sans-serif';ctx.lineWidth=1.5;
+    for(const [k,c]of [['x','#da9b96'],['y','#a2c4a0'],['z','#8fb9e4']]){
+      const dx=b.right[k]*28,dy=-b.up[k]*28;
+      ctx.strokeStyle=c;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+dx,y+dy);ctx.stroke();
+      ctx.fillStyle=c;ctx.fillText(k.toUpperCase(),x+dx+4,y+dy+4);
     }
   }
   function arrow(x, y, ex, ey, color) {
@@ -1820,6 +1869,7 @@
     $("energyDrift").textContent = fmt(stats.drift * 100, 4) + "%";
     $("stepCount").textContent = steps;
     $("bodyCount").textContent = bodies.length + " / " + MAX;
+    updateNavigationHUD();
     $("cameraLabel").textContent = follow
       ? getSelected()?.id === follow
         ? "За объектом"
@@ -1833,7 +1883,7 @@
         : "адаптивный шаг";
     $("simStatus").style.color = limited ? "var(--gold)" : "var(--muted)";
     $("viewLabel").textContent =
-      tilt < 0.01 ? "Ортогональная плоскость XY" : "Перспектива · XY + Z";
+      tilt < 0.01 ? "Сверху · плоскость XY" : "Перспектива · XY + Z";
     let s = 10 ** Math.floor(Math.log10(100 / scale));
     if (s * scale < 40) s *= 5;
     else if (s * scale < 75) s *= 2;
@@ -1989,7 +2039,7 @@
     updateOrbitNote();
     $("hint").textContent =
       tl === "select"
-        ? "Двойной щелчок — к объекту · ПКМ — осмотреть · Колесо / + − — приблизить"
+        ? "WASD + Q/E — полёт · Shift — быстрее · ПКМ — поворот"
         : text[tl];
   }
   document
@@ -2002,7 +2052,7 @@
       let p = project(b.x, b.y, b.z),
         r = screenRadius(b, p),
         d = Math.hypot(x - p.x, y - p.y);
-      if (d < Math.max(12, r + 6) && d < dist) {
+      if (!p.behind && d < Math.max(12, r + 6) && d < dist) {
         best = b;
         dist = d;
       }
@@ -2251,15 +2301,12 @@
     if (Math.hypot(e.clientX - pointer.x, e.clientY - pointer.y) > 4)
       pointer.moved = true;
     if (pointer.button === 2) {
-      yaw += dx * 0.006;
-      tilt = Math.max(0.025, Math.min(Math.PI - 0.025, tilt + dy * 0.005));
+      rotateCamera(dx * 0.006,dy * 0.005);
       $("view3d").classList.toggle("active", tilt > 0.01);
       $("viewTop").classList.toggle("active", tilt <= 0.01);
     } else if (pointer.button === 1 || (tool === "select" && pointer.moved)) {
-      let a = unproject(pointer.lastX, pointer.lastY, cam.z),
-        b = unproject(e.clientX, e.clientY, cam.z);
-      cam.x += a.x - b.x;
-      cam.y += a.y - b.y;
+      const basis=cameraBasis();
+      for(const k of ['x','y','z'])cam[k]+=(-basis.right[k]*dx+basis.up[k]*dy)/scale;
       follow = null;
     }
     pointer.lastX = e.clientX;
@@ -2310,6 +2357,7 @@
   cv.addEventListener("wheel",e=>{e.preventDefault();zoomBy(Math.exp(-Math.max(-500,Math.min(500,e.deltaY*(e.deltaMode===1?16:1)))*.0022));},{passive:false});
   cv.addEventListener("dblclick",e=>{let b=pick(e.clientX,e.clientY);if(b){select(b);focusPlanet();}});
   function focusPlanet(immediate=false){
+    clearNavigation();
     surfaceInspection=null;$("surfaceBack").hidden=true;
     immediate=immediate||matchMedia("(prefers-reduced-motion: reduce)").matches;
     let b=getSelected()||bodies.find(b=>b.planet==='earth')||bodies[0];if(!b)return;
@@ -2324,6 +2372,7 @@
     syncFields();
   }
   function fit() {
+    clearNavigation();surfaceInspection=null;$("surfaceBack").hidden=true;
     cameraFlight=null;
     follow = null;
     if (!bodies.length) {
@@ -2362,17 +2411,21 @@
   $("focusBtn").onclick = () => focusPlanet();
   $("fitBtn").onclick = fit;
   $("view3d").onclick = () => {
+    clearNavigation();cameraFlight=null;
     tilt = 0.58;
     yaw = -0.28;
     $("view3d").classList.add("active");
     $("viewTop").classList.remove("active");
   };
   $("viewTop").onclick = () => {
+    clearNavigation();cameraFlight=null;
     tilt = 0;
     yaw = 0;
     $("viewTop").classList.add("active");
     $("view3d").classList.remove("active");
   };
+  $("navReturn").onclick=()=>focusPlanet();
+  $("navTop").onclick=()=>$("viewTop").click();
   $("clearTrails").onclick = () => {
     bodies.forEach((b) => (b.trail = []));
     notify("Следы очищены");
@@ -2797,7 +2850,7 @@
     $("grRel").checked = settings.rel;
     events = [];
     effects = [];
-    lastImpact=null;impactWatch=null;contactPairs.clear();surfaceInspection=null;$('surfaceBack').hidden=true;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
+    clearNavigation();lastImpact=null;impactWatch=null;contactPairs.clear();surfaceInspection=null;$('surfaceBack').hidden=true;window.FoundryRenderer?.clearImpacts?.();if($("impactReport"))$("impactReport").hidden=true;
     pred = [];
     pointer = null;
     dirtyList = true;
@@ -2843,6 +2896,7 @@
   let helpPrevPaused = false,
     prevFocus = null;
   function showHelp() {
+    clearNavigation();
     helpPrevPaused = paused;
     paused = true;
     updatePause();
@@ -2875,7 +2929,8 @@
     notify("Снимок пространства сохранён в PNG");
   }
   addEventListener("keydown", (e) => {
-    let editing = ["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName);
+    let editing = editingControl(e.target);
+    if(e.ctrlKey||e.metaKey||e.altKey){clearNavigation();return;}
     if (!$("help").hidden) {
       if (e.key === "Escape") closeHelp();
       if (e.key === "Tab") {
@@ -2886,7 +2941,12 @@
       }
       return;
     }
-    if (editing) return;
+    if (editing || W<=1000) return;
+    if(navCodes.has(e.code)){e.preventDefault();navKeys.add(e.code);return;}
+    if(e.repeat)return;
+    if(e.code==='KeyR'){e.preventDefault();focusPlanet();return;}
+    if(e.code==='Home'){e.preventDefault();fit();return;}
+    if(e.code==='KeyT'){e.preventDefault();$('viewTop').click();return;}
     if (e.code === "Space") {
       e.preventDefault();
       togglePause();
@@ -2912,6 +2972,10 @@
     else if (e.key.toLowerCase() === "p") screenshot();
     else if (e.key === ".") $("stepBtn").click();
   });
+  addEventListener('keyup',e=>navKeys.delete(e.code));
+  addEventListener('blur',()=>{clearNavigation();cancelPointer();});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden){clearNavigation();cancelPointer();}});
+  document.addEventListener('focusin',e=>{if(editingControl(e.target))clearNavigation();});
   function sampleTrails() {
     for (let b of bodies) {
       let last = b.trail[b.trail.length - 1];
@@ -2961,6 +3025,7 @@
       cam.y = tracked.y;
       cam.z = tracked.z;
     }
+    navigateCamera(Math.min(wallDt,.05));
     draw(now, wallDt);
     if (now - uiLast > 200) {
       updateStats();

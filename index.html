@@ -8,7 +8,7 @@
       href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Ccircle cx=%2716%27 cy=%2716%27 r=%2711%27 fill=%27%23040507%27 stroke=%27%23d2c8b1%27/%3E%3Cellipse cx=%2716%27 cy=%2716%27 rx=%2715%27 ry=%274%27 transform=%27rotate(-25 16 16)%27 fill=%27none%27 stroke=%27%23d2c8b1%27/%3E%3C/svg%3E"
     />
     <title>ORBIT FOUNDRY — гравитационная песочница</title>
-    <link rel="stylesheet" href="./style.css?v=solid6" />
+    <link rel="stylesheet" href="./style.css?v=nav7" />
   </head>
   <body>
     <div id="webgl"></div>
@@ -212,6 +212,12 @@
       <div class="eyebrow">ORBIT FOUNDRY / LIVE VIEW</div>
       <strong id="viewLabel">Перспектива · XY + Z</strong>
     </div>
+    <section class="navigation-hud" aria-label="Ориентация камеры">
+      <div class="navigation-row"><strong id="navMode">Слежение</strong><div class="navigation-actions"><button id="navTop" title="Вид сверху — T">Сверху <kbd>T</kbd></button><button id="navReturn" title="Вернуться к выбранному — R">К объекту <kbd>R</kbd></button></div></div>
+      <div class="navigation-readout"><span id="navCenter">В центре: Земля</span><span id="navHeading"></span></div>
+      <div id="navSelection"></div>
+    </section>
+    <div id="navReticle" class="nav-reticle" aria-hidden="true" hidden></div>
     <aside class="panel right" aria-label="Инспектор и физика">
       <div class="tabs">
         <button class="active" data-tab="body">Объект</button
@@ -512,7 +518,7 @@
     <div class="zoom-dock" aria-label="Приближение камеры"><button id="zoomOut" aria-label="Отдалить">−</button><span id="cameraDistance">Камера</span><button id="zoomIn" aria-label="Приблизить">+</button></div>
     <div class="planet-caption"><span id="planetKicker">03 / EARTH</span><strong id="planetSubtitle">Наш дом.</strong><small id="planetFacts">Каменистая планета · наклон оси 23,4°</small></div>
     <div class="canvas-hint" id="hint">
-      Двойной щелчок — к объекту · ПКМ — осмотреть · Колесо / + − — приблизить
+      WASD + Q/E — полёт · Shift — быстрее · ПКМ — поворот
     </div>
     <footer class="bottom">
       <div class="transport">
@@ -586,6 +592,11 @@
         <div class="help-grid">
           <div>
             <h3>Управление</h3>
+            <div class="keyline"><span>Полёт вперёд / назад, влево / вправо</span><kbd>W S / A D</kbd></div>
+            <div class="keyline"><span>Вниз / вверх в кадре · быстрее</span><kbd>Q / E · Shift</kbd></div>
+            <div class="keyline"><span>Повернуть взгляд</span><kbd>Стрелки / ПКМ</kbd></div>
+            <div class="keyline"><span>К выбранному / сверху / вся система</span><kbd>R / T / Home</kbd></div>
+            <p>WASD включает свободный полёт, даже на паузе. Скорость подстраивается под масштаб и снижается у поверхности. В слежении ПКМ вращает камеру вокруг тела; в свободном полёте — меняет направление взгляда на месте. Метка в центре показывает, куда вы смотрите. «К объекту» возвращает к выбранной планете. Буквенные клавиши полёта работают и в русской раскладке; при вводе в поля они не двигают камеру. Углы и оси указаны в мировой системе XY/Z, не по географическому северу планеты.</p>
             <div class="keyline">
               <span>Выбор / панорамирование</span
               ><kbd>ЛКМ / перетаскивание</kbd>
@@ -724,9 +735,9 @@
         в окне шириной от 1000 px. Мобильная версия намеренно не предусмотрена.
       </div>
     </div>
-    <script src="./impact-physics.js?v=solid6"></script>
-    <script src="./solid-physics.js?v=solid6"></script>
-    <script src="./engine.js?v=solid6"></script>
-    <script type="module" src="./scene.js?v=solid6"></script>
+    <script src="./impact-physics.js?v=nav7"></script>
+    <script src="./solid-physics.js?v=nav7"></script>
+    <script src="./engine.js?v=nav7"></script>
+    <script type="module" src="./scene.js?v=nav7"></script>
   </body>
 </html>
