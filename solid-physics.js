@@ -35,5 +35,11 @@ function shave(a,b,contact){const aLocal=local(a,b),bLocal=local(b,a),v=Math.hyp
  if(a.mass>0&&b.mass>0){for(const k of ['x','y','z']){a['v'+k]+=dv[k]*impulse/a.mass;b['v'+k]-=dv[k]*impulse/b.mass;}}
  return{a:ca.removed||0,b:cb.removed||0,changed:ca.changed||cb.changed,limited:ca.limited||cb.limited,pressure};}
 function valid(s){if(!s||!Array.isArray(s.cuts))return null;const cuts=s.cuts.slice(0,256).filter(c=>['x','y','z','r'].every(k=>Number.isFinite(c[k]))&&c.r>0&&c.r<1e6&&Math.hypot(c.x,c.y,c.z)<1e6).map(c=>({x:c.x,y:c.y,z:c.z,r:c.r,...(c.crater?{crater:true,angle:clamp(c.angle||.1,1e-7,.6),depth:clamp(c.depth||.02,1e-9,.3)}:{})}));return Number.isFinite(s.mass0)&&s.mass0>0?{mass0:s.mass0,cuts,extraLoss:Number.isFinite(s.extraLoss)?Math.max(0,s.extraLoss):0,revision:cuts.length}:null;}
-const api={rotate,local,world,field,contains,state,cut,overlap,crater,shave,valid};root.SolidPhysics=api;if(typeof module!=='undefined')module.exports=api;
+// Sweep-and-prune over swept AABBs. Exact swept/contact tests remain narrow phase.
+function candidates(bodies,tides=false){const entries=[];for(let i=0;i<bodies.length;i++){const b=bodies[i];if(b.phase==='dust')continue;const p=b.previous||b,r=b.r;entries.push({b,i,minX:Math.min(b.x,p.x)-r,maxX:Math.max(b.x,p.x)+r,minY:Math.min(b.y,p.y)-r,maxY:Math.max(b.y,p.y)+r,minZ:Math.min(b.z,p.z)-r,maxZ:Math.max(b.z,p.z)+r});}entries.sort((a,b)=>a.minX-b.minX);const pairs=[],seen=new Set();const add=(a,b)=>{let i=a.i,j=b.i;if(i>j)[i,j]=[j,i];const key=i+','+j;if(!seen.has(key)){seen.add(key);pairs.push([i,j]);}};
+for(let i=0;i<entries.length;i++){const a=entries[i];for(let j=i+1;j<entries.length;j++){const b=entries[j];if(b.minX>a.maxX)break;if(a.minY<=b.maxY&&b.minY<=a.maxY&&a.minZ<=b.maxZ&&b.minZ<=a.maxZ)add(a,b);}}
+// Tidal interactions extend beyond the horizon; keep these pairs conservative.
+if(tides)for(const a of entries)if(a.b.kind==='bh')for(const b of entries)if(a!==b)add(a,b);
+pairs.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);candidates.last={bodies:entries.length,possible:entries.length*(entries.length-1)/2,candidates:pairs.length};return pairs.map(([i,j])=>[bodies[i],bodies[j]]);}
+const api={rotate,local,world,field,contains,state,cut,overlap,crater,shave,valid,candidates};root.SolidPhysics=api;if(typeof module!=='undefined')module.exports=api;
 })(typeof window!=='undefined'?window:globalThis);

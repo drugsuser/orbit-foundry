@@ -512,7 +512,6 @@
     }
   }
   function simulate(wanted) {
-    if(window.FoundryRenderer?.pendingSolids?.())return 0;
     let rem = wanted;
     steps = 0;
     limited = false;
@@ -529,7 +528,6 @@
       rem -= dt;
       contacts(dt);
       steps++;
-      if(window.FoundryRenderer?.pendingSolids?.())break;
       if (impactWatch === "done") {impactWatch=null; break;}
       if (steps % 6 === 0 && performance.now() - start > 15) break;
     }
@@ -675,6 +673,7 @@
     syncFields();
   }
   function materialContact(a,b,dt) {
+    window.FoundryRenderer?.prepareSolid?.(a);window.FoundryRenderer?.prepareSolid?.(b);
     const min=Math.min(a.r,b.r),max=Math.max(a.r,b.r),key=[a.id,b.id].sort((x,y)=>x-y).join(':');
     let pair=contactPairs.get(key),analysis;
     if(min/max<.055&&!pair){analysis=ImpactPhysics.analyze(a,b);const target=analysis.targetId===a.id?a:b,projectile=target===a?b:a;
@@ -738,10 +737,7 @@
   $('impactPreset').onchange=()=>{const presets={small:[1.26e13,1,20],large:[3.39e20,300,25],planet:[5.972e24,6371,50]};const p=presets[$('impactPreset').value];$('impactMass').value=p[0];$('impactRadius').value=p[1];$('impactSpeed').value=p[2];};
   function contacts(dt=0) {
     let did = false;
-    outer: for (let i = 0; i < bodies.length; i++) {
-      let a = bodies[i];
-      for (let j = i + 1; j < bodies.length; j++) {
-        let b = bodies[j];
+    outer: for (const [a,b] of SolidPhysics.candidates(bodies,settings.tides)) {
         if(a.phase==='dust'||b.phase==='dust')continue;
         let dx = b.x - a.x,
           dy = b.y - a.y,
@@ -817,7 +813,6 @@
             }
           }
         }
-      }
     }
     finishContacts();
     if (did) {

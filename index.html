@@ -8,7 +8,7 @@
       href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Ccircle cx=%2716%27 cy=%2716%27 r=%2711%27 fill=%27%23040507%27 stroke=%27%23d2c8b1%27/%3E%3Cellipse cx=%2716%27 cy=%2716%27 rx=%2715%27 ry=%274%27 transform=%27rotate(-25 16 16)%27 fill=%27none%27 stroke=%27%23d2c8b1%27/%3E%3C/svg%3E"
     />
     <title>ORBIT FOUNDRY — гравитационная песочница</title>
-    <link rel="stylesheet" href="./style.css?v=solid5" />
+    <link rel="stylesheet" href="./style.css?v=solid6" />
   </head>
   <body>
     <div id="webgl"></div>
@@ -221,7 +221,7 @@
       <div class="tab-pane" id="tab-body">
     <section id="impactReport" class="impact-report" aria-live="polite" hidden>
       <div class="eyebrow">ОБЪЁМНЫЙ КОНТАКТ / МАТЕРИАЛ</div>
-      <strong id="impactOutcome"></strong><p id="impactDetail"></p><p id="impactScale"></p><p id="impactHint" class="physics-note"></p><button id="inspectImpact" class="inspect-impact" hidden>↗ Рассмотреть вмятину</button>
+      <strong id="impactOutcome"></strong><p id="impactDetail"></p><p id="impactScale"></p><p id="impactHint" class="physics-note"></p><p id="meshStatus" class="physics-note" hidden>Форма уточняется в фоне · движение продолжается.</p><button id="inspectImpact" class="inspect-impact" hidden>↗ Рассмотреть вмятину</button>
       <button onclick="document.getElementById('impactReport').hidden=true" aria-label="Закрыть отчёт об ударе">×</button>
     </section>
 
@@ -664,7 +664,7 @@
                 кратер в сетке: кнопка «Рассмотреть вмятину» открывает нейтральный
                 режим рельефа. Срезанная масса переносится в баллистические облака;
                 масса и линейный импульс учитываются, часть энергии рассеивается.
-                На перестроение сетки физика кратко останавливается. До 256 вырезов
+                Сетка уточняется в фоне, не останавливая физику. До 256 вырезов
                 на тело. Это приближённое удаление материала, не гидрокод: нет
                 ударных волн, течения расплава и повторной аккреции облаков.
                 Звёзды всегда поглощают ударник как горячая плазма, даже в режиме отскока
@@ -724,9 +724,9 @@
         в окне шириной от 1000 px. Мобильная версия намеренно не предусмотрена.
       </div>
     </div>
-    <script src="./impact-physics.js?v=solid5"></script>
-    <script src="./solid-physics.js?v=solid5"></script>
-    <script src="./engine.js?v=solid5"></script>
-    <script type="module" src="./scene.js?v=solid5"></script>
+    <script src="./impact-physics.js?v=solid6"></script>
+    <script src="./solid-physics.js?v=solid6"></script>
+    <script src="./engine.js?v=solid6"></script>
+    <script type="module" src="./scene.js?v=solid6"></script>
   </body>
 </html>
