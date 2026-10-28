@@ -699,7 +699,7 @@
   }
   function reportImpact(result) {
     lastImpact={...result,serial:++impactSerial};
-    const labels={crater:'Вмятина в поверхности',shaving:'Срезание · контакт продолжается',pass:'Тела разошлись после срезания',eroded:'Вещество разрушено в зоне контакта',atmospheric:'Газовый контакт',absorption:'Испарение → поглощение'};
+    const labels={crater:'Вмятина в поверхности',shaving:'Срезание · контакт продолжается',pass:'Тела разошлись после срезания',eroded:'Вещество разрушено в зоне контакта',atmospheric:'Газовый контакт',absorption:'Испарение → поглощение',contact:'Неупругий контакт'};
     $('impactReport').hidden=false;
     document.querySelector('[data-tab=body]').click();
     const num=n=>n.toLocaleString('ru-RU',{maximumFractionDigits:2});
@@ -709,7 +709,8 @@
       'Диаметр '+num(result.craterRadius*2)+' км · глубина '+num(result.craterDepth)+' км':
       'В уцелевших телах: '+num(result.retained*100)+'% · в выбросе: '+num((1-result.retained)*100)+'%';
     $('impactHint').textContent=result.outcome==='absorption'?'Горячая плазма поглощает ударник.':result.outcome==='crater'?'Это углубление сетки, а не пятно. На масштабе всей планеты малый кратер почти не виден.':
-      'Удаляется только пересекающееся вещество. Уцелевшие части продолжают движение; срезанная масса уходит в облака выброса.';
+      result.outcome==='contact'?'На разрушение не хватило энергии или разрешения модели. Нормальная скорость погашена неупругим импульсом.':
+      'Объём среза ограничен энергией контакта. Разрушение и выброс расходуют общий бюджет; масса и линейный импульс учтены.';
     $('inspectImpact').hidden=!result.craterBody;
     if(!result.inProgress&&impactWatch && (result.targetId===impactWatch || result.projectileId===impactWatch)) {paused=true;impactWatch='done';updatePause();}
     if(!result.inProgress)event(labels[result.outcome]+': '+result.target);
@@ -717,54 +718,86 @@
   function depositDust(owner,mass,velocity,point,key,spread) {
     if(!(mass>1e-30))return;
     let dust=bodies.find(b=>b.dustKey===key&&b.phase==='dust');
-    if(dust){const total=dust.mass+mass;for(const k of ['x','y','z']){dust[k]=(dust[k]*dust.mass+point[k]*mass)/total;dust['v'+k]=(dust['v'+k]*dust.mass+velocity['v'+k]*mass)/total;}dust.mass=total;dust.r=owner.r*Math.cbrt(total/(owner.solid?.mass0||owner.mass||total));dust.spread=Math.max(dust.spread,spread);}
+    if(dust){const oldMass=dust.mass,total=oldMass+mass,nextSpread=Math.sqrt((oldMass*(dust.spread||0)**2+mass*spread**2)/total);for(const k of ['x','y','z']){dust[k]=(dust[k]*dust.mass+point[k]*mass)/total;dust['v'+k]=(dust['v'+k]*dust.mass+velocity['v'+k]*mass)/total;}dust.mass=total;dust.r=owner.r*Math.cbrt(total/(owner.solid?.mass0||owner.mass||total));dust.spread=nextSpread;}
     else if(bodies.length<MAX){dust=body({name:'Выброс · '+owner.name,kind:'debris',phase:'dust',mass,r:owner.r*Math.cbrt(mass/(owner.solid?.mass0||owner.mass||mass)),...point,...velocity,color:'#a8957f',dustKey:key,spread,born:t,tidalDone:true});}
     else{owner.mass+=mass;if(owner.solid)owner.solid.extraLoss-=mass;notify('Лимит тел: выброшенное вещество осталось неразрешённым в массе цели.');}
     return dust;
   }
+  function contactResponse(a,b,contact,budget) {
+    const heat=ImpactPhysics.respond(a,b,contact.normal);
+    if(budget){budget.contactHeat+=heat;budget.remaining=Math.max(0,budget.remaining-heat);}
+    // Only constrained contacts are separated. Free energetic grazes keep moving.
+    const depth=Math.max(0,a.r+b.r-Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z));
+    const distance=depth+(a.r+b.r)*1e-6,total=a.mass+b.mass;
+    for(const k of ['x','y','z']){a[k]-=contact.normal[k]*distance*b.mass/total;b[k]+=contact.normal[k]*distance*a.mass/total;}
+    return true;
+  }
   function excavate(target,projectile,analysis) {
-    const before=target.mass,oldP={x:before*target.vx+projectile.mass*projectile.vx,y:before*target.vy+projectile.mass*projectile.vy,z:before*target.vz+projectile.mass*projectile.vz};
+    const before=target.mass,total=before+projectile.mass,budget=ImpactPhysics.contactBudget(target,projectile,analysis);
+    const result=SolidPhysics.crater(target,projectile,analysis,.75*budget.remaining/(budget.qA*MS));
+    if(!result.changed||!(result.removed>0))return false;
     target.solidLock=true;
-    const result=SolidPhysics.crater(target,projectile,analysis),dustMass=result.removed+projectile.mass,total=before+projectile.mass,n=analysis.normal;
-    const vrel=analysis.speed/VUNIT,eject=Math.min(vrel*.4,Math.sqrt(.10*projectile.mass/Math.max(dustMass,1e-30))*vrel),velocity={};
-    for(const k of ['x','y','z']){velocity['v'+k]=oldP[k]/total+n[k]*eject;target['v'+k]=(oldP[k]-velocity['v'+k]*dustMass)/Math.max(1e-30,target.mass);}
+    const dustMass=result.removed+projectile.mass,n=analysis.normal;
+    const eject=ImpactPhysics.craterEjecta(target,projectile,result.removed,budget,n);
     const point=SolidPhysics.world(target,result.normal),projectileId=projectile.id;
     if(selected===projectileId)selected=target.id;if(follow===projectileId)follow=target.id;removeBody(projectile,true);
-    depositDust(target,dustMass,velocity,point,'impact-'+projectileId,eject*.65);
-    target.solid.revision++;window.FoundryRenderer?.sculpt?.(target);
-    window.FoundryRenderer?.impact?.(target,n,analysis.craterAngle,false);
-    reportImpact({...analysis,...result,target:target.name,outcome:'crater',targetId:target.id,projectileId,craterBody:target.id,craterNormal:result.normal,craterDepth:result.craterDepth,retained:target.mass/total});
-    syncFields();
+    depositDust(target,dustMass,eject.velocity,point,'impact-'+projectileId,eject.spread);
+    window.FoundryRenderer?.sculpt?.(target);
+    window.FoundryRenderer?.impact?.(target,n,result.angle,false);
+    reportImpact({...analysis,...result,target:target.name,outcome:'crater',targetId:target.id,projectileId,craterBody:target.id,craterNormal:result.normal,craterDepth:result.craterDepth,retained:target.mass/total,budget:{...budget}});
+    syncFields();return true;
   }
   function materialContact(a,b,dt) {
     window.FoundryRenderer?.prepareSolid?.(a);window.FoundryRenderer?.prepareSolid?.(b);
     const min=Math.min(a.r,b.r),max=Math.max(a.r,b.r),key=[a.id,b.id].sort((x,y)=>x-y).join(':');
     let pair=contactPairs.get(key),analysis;
-    if(min/max<.055&&!pair){analysis=ImpactPhysics.analyze(a,b);const target=analysis.targetId===a.id?a:b,projectile=target===a?b:a;
-      // A surviving-material query prevents impacts against an already empty crater.
+    if(min/max<.055&&!pair){
+      analysis=ImpactPhysics.analyze(a,b);const target=analysis.targetId===a.id?a:b,projectile=target===a?b:a;
       const entry={x:target.x+analysis.normal.x*target.r*.99999,y:target.y+analysis.normal.y*target.r*.99999,z:target.z+analysis.normal.z*target.r*.99999};
       if(target.solid&&!SolidPhysics.contains(target,entry))return false;
-      excavate(target,projectile,analysis);return true;
+      if(excavate(target,projectile,analysis))return true;
+      // Unresolved/zero-budget crater: do not silently eat the projectile.
     }
     const contact=SolidPhysics.overlap(a,b);if(!contact)return false;
-    if(!pair){analysis=ImpactPhysics.analyze(a,b);const rel={x:b.vx-a.vx,y:b.vy-a.vy,z:b.vz-a.vz},dr={x:b.x-a.x,y:b.y-a.y,z:b.z-a.z};
-      pair={a:a.id,b:b.id,initialA:a.mass,initialB:b.mass,total:a.mass+b.mass,speed:analysis.speed,energy:analysis.energy,target:a.name+' / '+b.name,lastA:null,lastB:null,offset:Math.sqrt(Math.max(0,1-analysis.incidence**2)),started:t};contactPairs.set(key,pair);
+    if(!pair){
+      analysis=analysis||ImpactPhysics.analyze(a,b);
+      pair={a:a.id,b:b.id,initialA:a.mass,initialB:b.mass,total:a.mass+b.mass,speed:analysis.speed,energy:analysis.energy,target:a.name+' / '+b.name,lastA:null,offset:Math.sqrt(Math.max(0,1-analysis.incidence**2)),started:t,budget:ImpactPhysics.contactBudget(a,b,analysis),removed:0,responded:false};
+      contactPairs.set(key,pair);
     }
-    a.solidLock=b.solidLock=true;
     if(pair.lastA&&Math.hypot(a.x-b.x-pair.lastA.x,a.y-b.y-pair.lastA.y,a.z-b.z-pair.lastA.z)<min*.035)return false;
-    const va={vx:a.vx,vy:a.vy,vz:a.vz},vb={vx:b.vx,vy:b.vy,vz:b.vz},result=SolidPhysics.shave(a,b,contact);
+    const dustKeyA='cut-'+key+'-a',dustKeyB='cut-'+key+'-b';
+    const needed=[dustKeyA,dustKeyB].filter(k=>!bodies.some(b=>b.phase==='dust'&&b.dustKey===k)).length;
+    // Reserve cloud slots before removing matter; never return invisible mass.
+    const capacity=bodies.length+needed<=MAX;
+    const result=capacity?SolidPhysics.shave(a,b,contact,ImpactPhysics.removalLimits(a,b,pair.budget)):{a:0,b:0,changed:false,limited:true};
     pair.lastA={x:a.x-b.x,y:a.y-b.y,z:a.z-b.z};
-    if(!result.changed)return false;
-    const spread=pair.speed/VUNIT*.12;
-    depositDust(a,result.a,va,contact.point,'cut-'+key+'-a',spread);depositDust(b,result.b,vb,contact.point,'cut-'+key+'-b',spread);
-    for(const body of [a,b]){if(body.solid&&body.mass<body.solid.mass0*.003){depositDust(body,body.mass,{vx:body.vx,vy:body.vy,vz:body.vz},contact.point,'cut-'+key+'-'+(body===a?'a':'b'),spread);removeBody(body,true);}else window.FoundryRenderer?.sculpt?.(body);}
+    if(result.changed)a.solidLock=b.solidLock=true;
+    if(result.a>0||result.b>0){
+      const eject=ImpactPhysics.shaveEjecta(a,b,result.a,result.b,pair.budget,contact.normal);
+      depositDust(a,result.a,eject.a,contact.point,dustKeyA,eject.spreadA);
+      depositDust(b,result.b,eject.b,contact.point,dustKeyB,eject.spreadB);
+      pair.removed+=result.a+result.b;
+    }
+    for(const body of [a,b]){
+      if(body.mass<=1e-30)removeBody(body,true);
+      else if(result.changed)window.FoundryRenderer?.sculpt?.(body);
+    }
+    if(bodies.includes(a)&&bodies.includes(b)&&result.limited){
+      const remaining=SolidPhysics.overlap(a,b);
+      if(remaining){contactResponse(a,b,remaining,pair.budget);pair.responded=true;}
+    }
+    if(!result.changed&&!pair.responded)return false;
     pair.remaining=(bodies.includes(a)?a.mass:0)+(bodies.includes(b)?b.mass:0);
-    reportImpact({targetId:a.id,projectileId:b.id,target:pair.target,speed:pair.speed,energy:pair.energy,retained:pair.remaining/pair.total,outcome:'shaving',inProgress:true});
+    reportImpact({targetId:a.id,projectileId:b.id,target:pair.target,speed:pair.speed,energy:pair.energy,retained:pair.remaining/pair.total,outcome:result.changed?'shaving':'contact',inProgress:true,budget:{...pair.budget}});
     baselineDirty=true;return true;
   }
   function finishContacts() {
-    for(const [key,p]of contactPairs){const a=bodies.find(b=>b.id===p.a),b=bodies.find(b=>b.id===p.b);if(a&&b&&Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z)<(a.r+b.r)*1.025)continue;
-      const remaining=(a?.mass||0)+(b?.mass||0);reportImpact({targetId:p.a,projectileId:p.b,target:p.target,speed:p.speed,energy:p.energy,retained:remaining/p.total,outcome:a&&b?'pass':'eroded'});contactPairs.delete(key);
+    for(const [key,p]of contactPairs){
+      const a=bodies.find(b=>b.id===p.a),b=bodies.find(b=>b.id===p.b);
+      if(a&&b&&Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z)<(a.r+b.r)*(p.responded?1:1.025))continue;
+      const remaining=(a?.mass||0)+(b?.mass||0);
+      reportImpact({targetId:p.a,projectileId:p.b,target:p.target,speed:p.speed,energy:p.energy,retained:remaining/p.total,outcome:a&&b?(p.removed>0?'pass':'contact'):'eroded',budget:{...p.budget}});
+      contactPairs.delete(key);
     }
   }
   function inspectImpact() {

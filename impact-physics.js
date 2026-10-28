@@ -60,5 +60,80 @@ function swept(a,b){
  if(!a.previous||!b.previous)return false;const x=a.previous.x-b.previous.x,y=a.previous.y-b.previous.y,z=a.previous.z-b.previous.z,dx=a.x-b.x-x,dy=a.y-b.y-y,dz=a.z-b.z-z,A=dx*dx+dy*dy+dz*dz;
  if(!(A>0))return false;const u=clamp(-(x*dx+y*dy+z*dz)/A,0,1);return Math.hypot(x+u*dx,y+u*dy,z+u*dz)<=radius;
 }
-const api={analyze,fragments,swept,units:{AU,MS,YEAR,G,V}};root.ImpactPhysics=api;if(typeof module!=='undefined')module.exports=api;
+// Cheap reduced-order material cost (J/kg), not a calibrated equation of state.
+// 0.15 GM/R represents partial gravitational lifting, not escape of every grain.
+function materialCost(b){
+ const mass=b.mass*MS,R=b.r*AU,rho=(b.solid?.mass0||b.mass)*MS/(4/3*Math.PI*R**3);
+ const strength=b.kind==='gas'?0:b.kind==='asteroid'?5e5:b.kind==='debris'?2e5:5e6;
+ return Math.max(1,strength/Math.max(1,rho)+.15*G*mass/Math.max(1,R));
+}
+function relativeEnergy(a,b,ma=a.mass,mb=b.mass){
+ return .5*(ma*mb/Math.max(ma+mb,1e-40))*MS*((a.vx-b.vx)**2+(a.vy-b.vy)**2+(a.vz-b.vz)**2)*V*V;
+}
+function contactBudget(a,b,analysis=analyze(a,b)){
+ const initial=Math.max(0,Math.min(relativeEnergy(a,b),analysis.deposited));
+ return{initial,remaining:initial,fracture:0,ejecta:0,internal:0,contactHeat:0,qA:materialCost(a),qB:materialCost(b)};
+}
+// No resetting this ledger at each integration step or each mesh revision.
+function removalLimits(a,b,budget){
+ const available=Math.min(budget.remaining,relativeEnergy(a,b));
+ return{maxA:.375*available/(budget.qA*MS),maxB:.375*available/(budget.qB*MS)};
+}
+function spend(budget,fracture,ejecta,internal=0){
+ budget.fracture+=fracture;budget.ejecta+=ejecta;budget.internal+=internal;
+ budget.remaining=Math.max(0,budget.remaining-fracture-ejecta);
+}
+// A cut first carries away the old owner's velocity. Cooling the relative
+// motion pays for fracture + ejection; source-local recoil then preserves P.
+// Half the ejection allocation is unresolved cloud expansion, half bulk motion.
+function shaveEjecta(a,b,lossA,lossB,budget,normal){
+ const ma=a.mass+lossA,mb=b.mass+lossB,total=ma+mb,E=relativeEnergy(a,b,ma,mb);
+ const work=lossA*MS*budget.qA+lossB*MS*budget.qB;
+ const eject=Math.max(0,Math.min(work/3,budget.remaining-work,E-work));
+ const factor=E>0?Math.sqrt(Math.max(0,(E-work-eject)/E)):0,com={};
+ for(const k of ['x','y','z'])com['v'+k]=(ma*a['v'+k]+mb*b['v'+k])/total;
+ const da={},db={};
+ for(const k of ['x','y','z']){
+  a['v'+k]=com['v'+k]+(a['v'+k]-com['v'+k])*factor;
+  b['v'+k]=com['v'+k]+(b['v'+k]-com['v'+k])*factor;
+  da['v'+k]=a['v'+k];db['v'+k]=b['v'+k];
+ }
+ const loss=lossA+lossB;
+ function split(core,dust,mass,sign,energy){
+  if(!(mass>0))return 0;
+  const internal=energy*.5,bulk=core.mass>0?energy*.5:0,mu=core.mass*mass/Math.max(core.mass+mass,1e-40)*MS;
+  const relative=mu>0?Math.sqrt(2*bulk/mu)/V:0;
+  for(const k of ['x','y','z']){
+   core['v'+k]-=sign*normal[k]*relative*mass/(core.mass+mass);
+   dust['v'+k]+=sign*normal[k]*relative*core.mass/(core.mass+mass);
+  }
+  return Math.sqrt(2*internal/(mass*MS))/V;
+ }
+ const spreadA=split(a,da,lossA,-1,loss>0?eject*lossA/loss:0);
+ const spreadB=split(b,db,lossB,1,loss>0?eject*lossB/loss:0);
+ spend(budget,work,eject,eject*.5);
+ return{a:da,b:db,spreadA,spreadB,work,eject};
+}
+function craterEjecta(target,projectile,removed,budget,normal){
+ const before=target.mass+removed,total=before+projectile.mass,dustMass=removed+projectile.mass;
+ const E=relativeEnergy(target,projectile,before,projectile.mass),work=removed*MS*budget.qA;
+ const eject=Math.max(0,Math.min(budget.remaining-work,E-work)),bulk=eject*.5,internal=eject*.5;
+ const mu=target.mass*dustMass/total*MS,relative=mu>0?Math.sqrt(2*bulk/mu)/V:0,dust={};
+ for(const k of ['x','y','z']){
+  const com=(before*target['v'+k]+projectile.mass*projectile['v'+k])/total;
+  target['v'+k]=com-normal[k]*relative*dustMass/total;
+  dust['v'+k]=com+normal[k]*relative*target.mass/total;
+ }
+ spend(budget,work,eject,internal);
+ return{velocity:dust,spread:Math.sqrt(2*internal/(dustMass*MS))/V,work,eject};
+}
+// Low-energy/capacity-limited contact only. Energetic shaving is not billiards.
+function respond(a,b,normal,restitution=.12){
+ let vn=0;for(const k of ['x','y','z'])vn+=(b['v'+k]-a['v'+k])*normal[k];
+ if(vn>=0||!(a.mass>0&&b.mass>0))return 0;
+ const mu=a.mass*b.mass/(a.mass+b.mass),impulse=-(1+restitution)*vn*mu;
+ for(const k of ['x','y','z']){a['v'+k]-=normal[k]*impulse/a.mass;b['v'+k]+=normal[k]*impulse/b.mass;}
+ return .5*mu*MS*vn*vn*V*V*(1-restitution**2);
+}
+const api={analyze,fragments,swept,materialCost,relativeEnergy,contactBudget,removalLimits,shaveEjecta,craterEjecta,respond,units:{AU,MS,YEAR,G,V}};root.ImpactPhysics=api;if(typeof module!=='undefined')module.exports=api;
 })(typeof window!=='undefined'?window:globalThis);

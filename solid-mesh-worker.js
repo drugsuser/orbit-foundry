@@ -1,6 +1,6 @@
 /* Closed surface reconstruction, off the UI thread. Adaptive conforming radial
    mesh for craters/grazes; marching tetrahedra for non-star-shaped deep cuts. */
-importScripts('./solid-physics.js?v=solid6');
+importScripts('./solid-physics.js?v=energy1');
 const P=SolidPhysics,clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 let base=null,refineSerial=0;
 function normalize(p){let l=Math.hypot(p[0],p[1],p[2]);return p.map(v=>v/l)}
