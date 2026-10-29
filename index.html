@@ -166,6 +166,12 @@
           <button id="view3d" class="active">Псевдо‑3D</button
           ><button id="viewTop">Вид сверху</button>
         </div>
+        <div class="field">
+          <label for="lookSensitivity">Чувствительность ПКМ · <output id="lookSensitivityValue" for="lookSensitivity">100%</output></label>
+          <input id="lookSensitivity" type="range" min="0.2" max="3" step="0.05" value="1" />
+          <button id="resetLookSensitivity" class="wide" type="button">Сбросить чувствительность</button>
+          <p class="physics-note">20–300% · сохраняется в этом браузере. ПКМ + WASD / Q / E — поворот и полёт одновременно. Скорость полёта не меняется.</p>
+        </div>
         <div class="check">
           <input type="checkbox" id="trails" /><label for="trails"
             >Следы движения</label
@@ -596,7 +602,7 @@
             <div class="keyline"><span>Вниз / вверх в кадре · быстрее</span><kbd>Q / E · Shift</kbd></div>
             <div class="keyline"><span>Повернуть взгляд</span><kbd>Стрелки / ПКМ</kbd></div>
             <div class="keyline"><span>К выбранному / сверху / вся система</span><kbd>R / T / Home</kbd></div>
-            <p>WASD включает свободный полёт, даже на паузе. Скорость подстраивается под масштаб и снижается у поверхности. В слежении ПКМ вращает камеру вокруг тела; в свободном полёте — меняет направление взгляда на месте. Метка в центре показывает, куда вы смотрите. «К объекту» возвращает к выбранной планете. Буквенные клавиши полёта работают и в русской раскладке; при вводе в поля они не двигают камеру. Углы и оси указаны в мировой системе XY/Z, не по географическому северу планеты.</p>
+            <p>WASD включает свободный полёт, даже на паузе. Скорость подстраивается под масштаб и снижается у поверхности. В слежении ПКМ вращает камеру вокруг тела; в свободном полёте — меняет направление взгляда на месте. ПКМ можно держать одновременно с WASD / Q / E и Shift. Чувствительность ПКМ настраивается во вкладке «Вид» (20–300%) и сохраняется в этом браузере. Метка в центре показывает, куда вы смотрите. «К объекту» возвращает к выбранной планете. Буквенные клавиши полёта работают и в русской раскладке; при вводе в поля они не двигают камеру. Углы и оси указаны в мировой системе XY/Z, не по географическому северу планеты.</p>
             <div class="keyline">
               <span>Выбор / панорамирование</span
               ><kbd>ЛКМ / перетаскивание</kbd>
@@ -741,7 +747,7 @@
     </div>
     <script src="./impact-physics.js?v=energy1"></script>
     <script src="./solid-physics.js?v=energy1"></script>
-    <script src="./engine.js?v=energy1"></script>
+    <script src="./engine.js?v=controls1"></script>
     <script type="module" src="./scene.js?v=energy1"></script>
   </body>
 </html>

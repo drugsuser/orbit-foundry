@@ -76,6 +76,26 @@
     cam = { x: 0, y: 0, z: 0 },
     targetScale = 100;
   let cameraFlight = null;
+  let lookSensitivity = 1;
+  const sensitivityKey = "orbit-foundry-look-sensitivity-v1";
+  function setLookSensitivity(value, persist = false) {
+    const number = Number(value);
+    lookSensitivity = Number.isFinite(number)
+      ? Math.max(0.2, Math.min(3, number)) : 1;
+    $("lookSensitivity").value = lookSensitivity;
+    $("lookSensitivityValue").textContent = Math.round(lookSensitivity * 100) + "%";
+    if (persist) {
+      try { localStorage.setItem(sensitivityKey, String(lookSensitivity)); }
+      catch (_) { /* Private/restricted storage must not break camera input. */ }
+    }
+  }
+  try {
+    const saved = localStorage.getItem(sensitivityKey);
+    if (saved !== null) setLookSensitivity(saved);
+  } catch (_) {}
+  setLookSensitivity(lookSensitivity);
+  $("lookSensitivity").oninput = () => setLookSensitivity($("lookSensitivity").value, true);
+  $("resetLookSensitivity").onclick = () => setLookSensitivity(1, true);
   const navKeys = new Set(), navCodes = new Set(["KeyW","KeyA","KeyS","KeyD","KeyQ","KeyE","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","ShiftLeft","ShiftRight"]);
   const editingControl = el => !!el && (el.isContentEditable || !!el.closest?.("input,select,textarea,[contenteditable]:not([contenteditable=false])"));
   function clearNavigation(){navKeys.clear();}
@@ -95,7 +115,7 @@
     $("view3d").classList.add("active");$("viewTop").classList.remove("active");
   }
   function navigateCamera(dt){
-    if(!navKeys.size || W<=1000 || document.hidden || !$('help').hidden || editingControl(document.activeElement) || pointer)return;
+    if(!navKeys.size || W<=1000 || document.hidden || !$('help').hidden || editingControl(document.activeElement) || (pointer && pointer.button !== 2))return;
     const key=c=>navKeys.has(c)?1:0, strafe=key('KeyD')-key('KeyA'),forward=key('KeyW')-key('KeyS'),rise=key('KeyE')-key('KeyQ');
     const turn=key('ArrowRight')-key('ArrowLeft'),pitch=key('ArrowDown')-key('ArrowUp');
     if(!strafe&&!forward&&!rise&&!turn&&!pitch)return;
@@ -2334,7 +2354,7 @@
     if (Math.hypot(e.clientX - pointer.x, e.clientY - pointer.y) > 4)
       pointer.moved = true;
     if (pointer.button === 2) {
-      rotateCamera(dx * 0.006,dy * 0.005);
+      rotateCamera(dx * 0.006 * lookSensitivity,dy * 0.005 * lookSensitivity);
       $("view3d").classList.toggle("active", tilt > 0.01);
       $("viewTop").classList.toggle("active", tilt <= 0.01);
     } else if (pointer.button === 1 || (tool === "select" && pointer.moved)) {
